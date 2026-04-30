@@ -1,24 +1,26 @@
-# fly.toml - 請將 app 改為你的 app 名稱
+# fly.toml app configuration file generated for tg-remine on 2026-04-30T08:49:58Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "your-tg-bot"            # ← 改成你的 fly app 名稱
-primary_region = "nrt"         # 東京（最近台灣）
+app = 'tg-remine'
+primary_region = 'nrt'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  PORT = "8080"
-  # WEBHOOK_URL、TELEGRAM_BOT_TOKEN、DATABASE_URL、GOOGLE_API_KEY
-  # 請用 fly secrets set KEY=VALUE 設定，不要寫在這裡
+  PORT = '8080'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = false   # 防止休眠
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
 
 [[vm]]
-  memory = "256mb"
-  cpu_kind = "shared"
+  memory = '256mb'
+  cpu_kind = 'shared'
   cpus = 1
+  memory_mb = 256
