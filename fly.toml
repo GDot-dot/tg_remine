@@ -1,0 +1,24 @@
+# fly.toml - 請將 app 改為你的 app 名稱
+
+app = "your-tg-bot"            # ← 改成你的 fly app 名稱
+primary_region = "nrt"         # 東京（最近台灣）
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  # WEBHOOK_URL、TELEGRAM_BOT_TOKEN、DATABASE_URL、GOOGLE_API_KEY
+  # 請用 fly secrets set KEY=VALUE 設定，不要寫在這裡
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false   # 防止休眠
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
