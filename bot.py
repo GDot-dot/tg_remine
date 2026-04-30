@@ -1,15 +1,19 @@
-# bot.py - Telegram AI 智慧管家機器人（LINE 完整移植版）
-# python-telegram-bot v20+（async）
+# bot.py - Telegram AI 智慧管家（FastAPI + uvicorn + PTB v20/21）
+#
+# FastAPI 負責 HTTP 綁定（讓 Fly.io smoke check 通過），
+# PTB Application 處理 bot 邏輯，兩者共用同一 asyncio event loop。
 
 import os
 import logging
-import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
 import pytz
+import uvicorn
+from fastapi import FastAPI, Request, Response
 from telegram import (
     Update, InlineKeyboardMarkup, InlineKeyboardButton,
-    KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -24,101 +28,92 @@ from db import (
     update_event_content, delete_event_by_id,
     add_location, get_locations, get_location_by_name, delete_location,
     save_memory, query_memory, forget_memory, list_memories,
-    add_user_card, delete_user_card, get_user_cards,
 )
 from scheduler import (
     scheduler, safe_start, safe_add_job, safe_add_cron,
     remove_job, send_reminder, TAIPEI_TZ, PRIORITY_RULES,
 )
-from features.ai_parser import parse_natural_language
-from features.credit_card import analyze_best_card
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # https://your-app.fly.dev
+BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")
+PORT        = int(os.environ.get("PORT", 8080))
 
-# user_states: {user_id: {"action": str, ...}}
 user_states: dict[int, dict] = {}
 
-# ── Keyboards ─────────────────────────────────────────────────────────────────
+
+# ── 鍵盤工具 ─────────────────────────────────────────────────────────────────
 
 def kb(*rows) -> InlineKeyboardMarkup:
-    """快速建立 InlineKeyboard，rows 是 List[List[(text, data)]]"""
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in rows]
     )
-
 
 WEEKDAY_CODES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 WEEKDAY_NAMES = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
 
 
-def recurring_kb(selected: set[str]) -> InlineKeyboardMarkup:
-    """週期提醒星期選擇鍵盤"""
-    row1 = []
-    for code, name in zip(WEEKDAY_CODES[:4], WEEKDAY_NAMES[:4]):
-        label = f"✅{name}" if code in selected else name
-        row1.append(InlineKeyboardButton(label, callback_data=f"rec:toggle:{code}"))
-    row2 = []
-    for code, name in zip(WEEKDAY_CODES[4:], WEEKDAY_NAMES[4:]):
-        label = f"✅{name}" if code in selected else name
-        row2.append(InlineKeyboardButton(label, callback_data=f"rec:toggle:{code}"))
-    row3 = [InlineKeyboardButton("⏰ 設定時間", callback_data="rec:settime")]
-    row4 = [InlineKeyboardButton("❌ 取消", callback_data="cancel")]
-    return InlineKeyboardMarkup([row1, row2, row3, row4])
+def recurring_kb(selected: set) -> InlineKeyboardMarkup:
+    rows = []
+    for chunk in [WEEKDAY_CODES[:4], WEEKDAY_CODES[4:]]:
+        row = []
+        for code in chunk:
+            idx   = WEEKDAY_CODES.index(code)
+            label = f"✅{WEEKDAY_NAMES[idx]}" if code in selected else WEEKDAY_NAMES[idx]
+            row.append(InlineKeyboardButton(label, callback_data=f"rec:toggle:{code}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⏰ 設定時間", callback_data="rec:settime")])
+    rows.append([InlineKeyboardButton("❌ 取消", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
 
 
-def reminder_list_kb(events: list, page: int = 0, page_size: int = 5) -> tuple[str, InlineKeyboardMarkup]:
-    """提醒清單（分頁）"""
+def reminder_list_kb(events: list, page: int = 0, page_size: int = 5):
     total = len(events)
-    start = page * page_size
-    chunk = events[start:start + page_size]
-
-    lines = [f"📋 <b>提醒清單</b> ({total} 筆)\n"]
+    chunk = events[page * page_size:(page + 1) * page_size]
+    lines = [f"📋 <b>提醒清單</b>（共 {total} 筆）\n"]
     buttons = []
     for ev in chunk:
         if ev.is_recurring:
-            t = f"🔁 {ev.event_content} [{ev.recurrence_rule}]"
+            line = f"🔁 {ev.event_content} [{ev.recurrence_rule}]"
         else:
-            rt = ev.reminder_time.astimezone(TAIPEI_TZ)
+            rt      = ev.reminder_time.astimezone(TAIPEI_TZ)
             snoozing = ev.reminder_time != ev.event_datetime
-            icon = "💤" if snoozing else "⏰"
-            t = f"{icon} {rt.strftime('%m/%d %H:%M')} {ev.event_content}"
-        lines.append(t)
+            icon    = "💤" if snoozing else "⏰"
+            prefix  = "(延) " if snoozing else ""
+            line    = f"{icon} {rt.strftime('%m/%d %H:%M')} {prefix}{ev.event_content}"
+        lines.append(line)
         buttons.append([
-            InlineKeyboardButton(f"✏️ {ev.event_content[:10]}", callback_data=f"re:edit:{ev.id}"),
-            InlineKeyboardButton("🗑️", callback_data=f"re:del:{ev.id}"),
+            InlineKeyboardButton(f"✏️ {ev.event_content[:12]}", callback_data=f"re:edit:{ev.id}"),
+            InlineKeyboardButton("🗑️ 刪除", callback_data=f"re:del:{ev.id}"),
         ])
-
-    # 分頁按鈕
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀ 上頁", callback_data=f"re:page:{page-1}"))
-    if start + page_size < total:
+    if (page + 1) * page_size < total:
         nav.append(InlineKeyboardButton("下頁 ▶", callback_data=f"re:page:{page+1}"))
     if nav:
         buttons.append(nav)
-
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── 工具函式 ─────────────────────────────────────────────────────────────────
+
+def now_taipei() -> datetime:
+    return datetime.now(TAIPEI_TZ)
 
 def is_group(update: Update) -> bool:
     return update.effective_chat.type in ("group", "supergroup")
 
-
 def chat_type(update: Update) -> str:
-    t = update.effective_chat.type
-    return "group" if t in ("group", "supergroup") else "private"
+    return "group" if is_group(update) else "private"
 
-
-async def reply(update: Update, text: str,
-                keyboard=None, parse_mode=ParseMode.HTML):
-    kwargs = {"parse_mode": parse_mode}
+async def reply(update: Update, text: str, keyboard=None):
+    kwargs = {"parse_mode": ParseMode.HTML}
     if keyboard:
         kwargs["reply_markup"] = keyboard
     if update.callback_query:
@@ -126,25 +121,12 @@ async def reply(update: Update, text: str,
     else:
         await update.message.reply_text(text, **kwargs)
 
-
-def now_taipei() -> datetime:
-    return datetime.now(TAIPEI_TZ)
-
-
-def parse_datetime_text(text: str) -> datetime | None:
-    """解析『日期 時間』格式，例如 '2025-12-25 09:00' 或 '12/25 09:00'"""
-    formats = [
-        "%Y-%m-%d %H:%M",
-        "%Y/%m/%d %H:%M",
-        "%m/%d %H:%M",
-        "%m-%d %H:%M",
-        "%H:%M",  # 今天的時間
-    ]
+def parse_dt(text: str) -> datetime | None:
+    formats = ["%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M", "%m/%d %H:%M", "%m-%d %H:%M", "%H:%M"]
     now = now_taipei()
     for fmt in formats:
         try:
             dt = datetime.strptime(text.strip(), fmt)
-            # 補年月
             if fmt == "%H:%M":
                 dt = dt.replace(year=now.year, month=now.month, day=now.day)
             elif fmt in ("%m/%d %H:%M", "%m-%d %H:%M"):
@@ -155,7 +137,7 @@ def parse_datetime_text(text: str) -> datetime | None:
     return None
 
 
-# ── /start & /help ─────────────────────────────────────────────────────────────
+# ── /start & /help ────────────────────────────────────────────────────────────
 
 HELP_TEXT = """🤖 <b>AI 智慧管家</b>
 
@@ -166,434 +148,303 @@ HELP_TEXT = """🤖 <b>AI 智慧管家</b>
 <code>提醒清單</code> — 管理所有提醒
 
 <b>📍 地點功能</b>
-<code>地點</code> / <code>地點清單</code> — 查看儲存地點
-<code>找地點 [名稱]</code> — 回傳位置
+<code>找地點 [名稱]</code> / <code>地點清單</code>
 <code>刪除地點 [名稱]</code>
-（傳送 Telegram 位置訊息可儲存）
+（傳送位置訊息可儲存）
 
 <b>🧠 記憶功能</b>
 <code>記住 [關鍵字] [內容]</code>
 <code>查詢 [關鍵字]</code>
-<code>忘記 [關鍵字]</code>
-<code>記憶清單</code>
+<code>忘記 [關鍵字]</code> / <code>記憶清單</code>
 
-<b>💳 信用卡小幫手</b>
-<code>新增卡片 [名稱]</code>
-<code>刪除卡片 [名稱]</code>
-<code>我的卡包</code>
-<code>刷 [商家]</code> — AI 推薦最佳刷卡
-
-<b>通用</b>
-<code>取消</code> — 中斷目前操作"""
-
+<b>通用</b>：<code>取消</code> — 中斷操作"""
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reply(update, f"👋 歡迎使用 AI 智慧管家！\n\n{HELP_TEXT}")
-
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reply(update, HELP_TEXT)
 
 
-# ── 提醒指令 ──────────────────────────────────────────────────────────────────
+# ── 提醒 ─────────────────────────────────────────────────────────────────────
 
-def _parse_reminder_command(text: str) -> tuple[str | None, str | None, str | None]:
-    """解析『提醒 [誰] [日期] [時間] [事件]』
-    回傳 (display_name, datetime_str, content) 或 (None, None, None)"""
+def _parse_reminder_text(text: str):
     import re
-    # 格式：提醒 誰 YYYY-MM-DD HH:MM 事件
-    # 也支援：提醒 誰 MM/DD HH:MM 事件
-    pattern = r"^(?:提醒|重要提醒)\s+(\S+)\s+(\d{4}[-/]\d{2}[-/]\d{2}|\d{1,2}[/-]\d{1,2})\s+(\d{1,2}:\d{2})\s+(.+)$"
-    m = re.match(pattern, text)
-    if m:
-        who, date_str, time_str, content = m.groups()
-        dt_str = f"{date_str} {time_str}".replace("/", "-")
-        return who, dt_str, content
-    return None, None, None
-
+    pat = r"^(?:提醒|重要提醒)\s+(\S+)\s+(\d{4}[-/]\d{2}[-/]\d{2}|\d{1,2}[/-]\d{1,2})\s+(\d{1,2}:\d{2})\s+(.+)$"
+    m = re.match(pat, text)
+    if not m:
+        return None, None, None
+    who, date_s, time_s, content = m.groups()
+    dt = parse_dt(f"{date_s.replace('/','-')} {time_s}")
+    return who, dt, content
 
 async def handle_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
-    user_id = update.effective_user.id
+    user_id     = update.effective_user.id
     is_priority = text.startswith("重要提醒")
-
-    who, dt_str, content = _parse_reminder_command(text)
-    if not (who and dt_str and content):
+    who, dt, content = _parse_reminder_text(text)
+    if not (who and dt and content):
         await reply(update,
-                    "格式：<code>提醒 [誰] [日期] [時間] [事件]</code>\n"
-                    "例：<code>提醒 我 2025-08-01 09:00 開會</code>")
-        return
-
-    dt = parse_datetime_text(f"{dt_str}")
-    if dt is None:
-        await reply(update, "❌ 時間格式無法解析，請用 YYYY-MM-DD HH:MM 格式。")
+            "格式：<code>提醒 [誰] [日期] [時間] [事件]</code>\n"
+            "例：<code>提醒 我 2025-08-01 09:00 開會</code>")
         return
     if dt <= now_taipei():
         await reply(update, "❌ 設定的時間已經過了！")
         return
-
     display = update.effective_user.first_name or who
     chat_id = str(update.effective_chat.id)
-    ctype = chat_type(update)
-
-    priority = 0
-    remaining = 0
+    ctype   = chat_type(update)
     if is_priority:
-        # 先問優先等級
         user_states[user_id] = {
             "action": "set_priority",
             "who": who, "dt": dt, "content": content,
             "chat_id": chat_id, "ctype": ctype, "display": display,
         }
         await reply(update, "❗ 請選擇重要程度：",
-                    kb([("🟢 低（30分重提）", "prio:1"),
-                        ("🟡 中（10分重提）", "prio:2")],
-                       [("🔴 高（5分重提）",  "prio:3")]))
+            kb([("🟢 低（30分重提）", "prio:1"), ("🟡 中（10分重提）", "prio:2")],
+               [("🔴 高（5分重提）", "prio:3")]))
         return
-
-    event_id = add_event(
-        creator_user_id=user_id,
-        target_id=chat_id,
-        target_type=ctype,
-        display_name=display,
-        content=content,
-        event_datetime=dt,
-    )
+    event_id = add_event(creator_user_id=user_id, target_id=chat_id,
+                         target_type=ctype, display_name=display,
+                         content=content, event_datetime=dt)
     if not event_id:
         await reply(update, "❌ 建立提醒失敗，請稍後再試。")
         return
-
     safe_add_job(send_reminder, dt, [event_id], f"reminder_{event_id}")
     await reply(update,
-                f"✅ 提醒已設定！\n\n"
-                f"👤 {who}\n📅 {dt.strftime('%Y/%m/%d %H:%M')}\n📝 {content}")
-
-
-async def handle_priority_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, data: str):
-    """處理重要提醒優先等級選擇"""
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-    state = user_states.get(user_id, {})
-    if state.get("action") != "set_priority":
-        return
-
-    level = int(data.split(":")[1])  # prio:1
-    rule = PRIORITY_RULES[level]
-
-    dt = state["dt"]
-    content = state["content"]
-    display = state["display"]
-    chat_id = state["chat_id"]
-    ctype = state["ctype"]
-
-    event_id = add_event(
-        creator_user_id=user_id,
-        target_id=chat_id,
-        target_type=ctype,
-        display_name=display,
-        content=content,
-        event_datetime=dt,
-        priority_level=level,
-        remaining_repeats=rule["repeats"],
-    )
-    del user_states[user_id]
-
-    if not event_id:
-        await query.edit_message_text("❌ 建立失敗，請稍後再試。")
-        return
-
-    safe_add_job(send_reminder, dt, [event_id], f"reminder_{event_id}")
-    icon = rule["icon"]
-    await query.edit_message_text(
-        f"{icon} 重要提醒已設定！\n\n"
-        f"👤 {display}\n📅 {dt.strftime('%Y/%m/%d %H:%M')}\n"
-        f"📝 {content}\n⏱️ 未確認將每 {rule['interval']} 分鐘重提")
-
+        f"✅ 提醒已設定！\n\n👤 {who}\n📅 {dt.strftime('%Y/%m/%d %H:%M')}\n📝 {content}")
 
 async def handle_reminder_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: int = 0):
     user_id = update.effective_user.id
-    events = get_user_events(str(user_id))
+    events  = get_user_events(str(user_id))
     if not events:
         await reply(update, "📋 目前沒有任何提醒。")
         return
     text, markup = reminder_list_kb(events, page)
     if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+        await update.callback_query.edit_message_text(
+            text, reply_markup=markup, parse_mode=ParseMode.HTML)
     else:
         await reply(update, text, markup)
 
-
-# ── 提醒 Callback（確認/延後/刪除/編輯）─────────────────────────────────────────
-
-async def cb_confirm_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
-    query = update.callback_query
-    await query.answer("✅ 已確認！")
+async def cb_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
+    q = update.callback_query
+    await q.answer("✅ 已確認！")
     ev = get_event(event_id)
     if ev:
         mark_reminder_sent(event_id)
         remove_job(event_id)
         if ev.priority_level > 0:
             delete_event_by_id(event_id, str(update.effective_user.id))
-    await query.edit_message_text("✅ 提醒已確認，任務完成！")
-
+    await q.edit_message_text("✅ 提醒已確認，任務完成！")
 
 async def cb_snooze(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int, minutes: int):
-    query = update.callback_query
-    await query.answer(f"💤 延後 {minutes} 分鐘")
+    q = update.callback_query
+    await q.answer(f"💤 延後 {minutes} 分鐘")
     new_time = now_taipei() + timedelta(minutes=minutes)
     update_reminder_time(event_id, new_time)
     safe_add_job(send_reminder, new_time, [event_id], f"reminder_{event_id}")
-    await query.edit_message_text(
-        f"💤 已延後 {minutes} 分鐘\n"
-        f"⏰ 新提醒時間：{new_time.strftime('%H:%M')}")
+    await q.edit_message_text(
+        f"💤 已延後 {minutes} 分鐘\n新提醒時間：{new_time.strftime('%H:%M')}")
 
-
-async def cb_delete_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-    # 確認提示
-    await query.edit_message_text(
-        "⚠️ 確定要刪除此提醒？",
-        reply_markup=kb(
-            [("✅ 確認刪除", f"re:delok:{event_id}"), ("❌ 取消", "cancel")]
-        )
-    )
-
+async def cb_delete_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("⚠️ 確定要刪除此提醒？",
+        reply_markup=kb([("✅ 確認刪除", f"re:delok:{event_id}"), ("❌ 取消", "cancel")]))
 
 async def cb_delete_ok(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-    ev = get_event(event_id)
-    if ev:
-        remove_job(event_id)
-        delete_event_by_id(event_id, str(user_id))
-        await query.edit_message_text("🗑️ 提醒已刪除。")
-    else:
-        await query.edit_message_text("❌ 找不到該提醒。")
+    q = update.callback_query
+    await q.answer()
+    remove_job(event_id)
+    ok = delete_event_by_id(event_id, str(update.effective_user.id))
+    await q.edit_message_text("🗑️ 已刪除。" if ok else "❌ 找不到該提醒。")
 
-
-async def cb_edit_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
+async def cb_edit_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
+    q = update.callback_query
+    await q.answer()
     ev = get_event(event_id)
     if not ev:
-        await query.edit_message_text("❌ 找不到該提醒。")
+        await q.edit_message_text("❌ 找不到該提醒。")
         return
-    user_states[user_id] = {"action": "edit_reminder_content", "event_id": event_id,
-                             "original": ev.event_content}
-    await query.edit_message_text(
+    user_states[update.effective_user.id] = {
+        "action": "edit_reminder_content",
+        "event_id": event_id,
+        "original": ev.event_content,
+    }
+    await q.edit_message_text(
         f"✏️ 請輸入新的提醒內容：\n（目前：{ev.event_content}）\n\n"
-        f"💡 以 <code>+</code> 開頭可補充而非覆蓋")
+        "💡 以 <code>+</code> 開頭可補充而非覆蓋",
+        parse_mode=ParseMode.HTML)
+
+async def cb_priority(update: Update, ctx: ContextTypes.DEFAULT_TYPE, level: int):
+    q       = update.callback_query
+    await q.answer()
+    user_id = update.effective_user.id
+    state   = user_states.get(user_id, {})
+    if state.get("action") != "set_priority":
+        return
+    rule    = PRIORITY_RULES[level]
+    dt, content, display = state["dt"], state["content"], state["display"]
+    chat_id, ctype = state["chat_id"], state["ctype"]
+    del user_states[user_id]
+    event_id = add_event(creator_user_id=user_id, target_id=chat_id,
+                         target_type=ctype, display_name=display,
+                         content=content, event_datetime=dt,
+                         priority_level=level, remaining_repeats=rule["repeats"])
+    if not event_id:
+        await q.edit_message_text("❌ 建立失敗。")
+        return
+    safe_add_job(send_reminder, dt, [event_id], f"reminder_{event_id}")
+    await q.edit_message_text(
+        f"{rule['icon']} 重要提醒已設定！\n\n"
+        f"📅 {dt.strftime('%Y/%m/%d %H:%M')}\n📝 {content}\n"
+        f"⏱️ 未確認將每 {rule['interval']} 分鐘重提")
 
 
 # ── 週期提醒 ─────────────────────────────────────────────────────────────────
 
 async def handle_recurring(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_states[update.effective_user.id] = {"action": "recurring_select_days", "days": set()}
+    await reply(update, "🔁 週期提醒設定\n請選擇要提醒的星期（可多選）：", recurring_kb(set()))
+
+async def cb_rec_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE, day: str):
+    q = update.callback_query
+    await q.answer()
     user_id = update.effective_user.id
-    user_states[user_id] = {"action": "recurring_select_days", "days": set()}
-    await reply(update, "🔁 週期提醒設定\n\n請選擇要提醒的星期（可多選）：",
-                recurring_kb(set()))
+    state   = user_states.setdefault(user_id, {"action": "recurring_select_days", "days": set()})
+    days: set = state.setdefault("days", set())
+    days.discard(day) if day in days else days.add(day)
+    await q.edit_message_text(
+        "🔁 週期提醒設定\n請選擇要提醒的星期（可多選）：",
+        reply_markup=recurring_kb(days))
 
-
-async def cb_recurring_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE, day: str):
-    query = update.callback_query
-    await query.answer()
+async def cb_rec_settime(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
     user_id = update.effective_user.id
-    state = user_states.setdefault(user_id, {"action": "recurring_select_days", "days": set()})
-    days: set = state.get("days", set())
-    if day in days:
-        days.discard(day)
-    else:
-        days.add(day)
-    state["days"] = days
-    await query.edit_message_text("🔁 週期提醒設定\n\n請選擇要提醒的星期（可多選）：",
-                                  reply_markup=recurring_kb(days))
-
-
-async def cb_recurring_settime(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-    state = user_states.get(user_id, {})
-    days = state.get("days", set())
+    days    = user_states.get(user_id, {}).get("days", set())
     if not days:
-        await query.answer("⚠️ 請至少選擇一天！", show_alert=True)
+        await q.answer("⚠️ 請至少選一天！", show_alert=True)
         return
-    state["action"] = "recurring_set_time"
-    await query.edit_message_text("⏰ 請輸入提醒時間（格式：HH:MM，如 09:00）：")
+    user_states[user_id]["action"] = "recurring_set_time"
+    await q.edit_message_text("⏰ 請輸入提醒時間（格式：HH:MM，如 09:00）：")
 
-
-async def handle_recurring_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                                 user_id: int, text: str):
-    """使用者輸入週期提醒時間"""
-    state = user_states.get(user_id, {})
-    import re
-    m = re.match(r"^(\d{1,2}):(\d{2})$", text.strip())
-    if not m:
-        await reply(update, "❌ 格式錯誤，請輸入 HH:MM，如 09:00")
-        return
-    h, minute = int(m.group(1)), int(m.group(2))
-    state["time"] = f"{h:02d}:{minute:02d}"
-    state["action"] = "recurring_input_content"
-    await reply(update, "📝 請輸入提醒事項內容：")
-
-
-async def handle_recurring_content(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                                    user_id: int, text: str):
-    """使用者輸入週期提醒內容，完成設定"""
-    state = user_states.pop(user_id, {})
+async def _finish_recurring(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                             user_id: int, time_str: str, content: str):
+    state    = user_states.pop(user_id, {})
     days: set = state.get("days", set())
-    time_str: str = state.get("time", "09:00")
-    content = text.strip()
-
-    days_str = ",".join(sorted(days))  # "mon,wed"
-    rule = f"{days_str}|{time_str}"
+    days_str  = ",".join(sorted(days))
+    rule_str  = f"{days_str}|{time_str}"
     h, minute = map(int, time_str.split(":"))
-    display = update.effective_user.first_name or "您"
-    chat_id = str(update.effective_chat.id)
-
-    event_id = add_event(
+    display   = update.effective_user.first_name or "您"
+    event_id  = add_event(
         creator_user_id=user_id,
-        target_id=chat_id,
+        target_id=str(update.effective_chat.id),
         target_type=chat_type(update),
         display_name=display,
         content=content,
         event_datetime=now_taipei(),
         is_recurring=1,
-        recurrence_rule=rule,
+        recurrence_rule=rule_str,
     )
     if not event_id:
         await reply(update, "❌ 建立失敗，請稍後再試。")
         return
-
-    safe_add_cron(send_reminder, [event_id], f"recurring_{event_id}",
-                  days_str, h, minute)
-
+    safe_add_cron(send_reminder, [event_id], f"recurring_{event_id}", days_str, h, minute)
     day_names = [WEEKDAY_NAMES[WEEKDAY_CODES.index(d)] for d in sorted(days) if d in WEEKDAY_CODES]
     await reply(update,
-                f"✅ 週期提醒已設定！\n\n"
-                f"📆 每{'/'.join(day_names)} {time_str}\n"
-                f"📝 {content}")
+        f"✅ 週期提醒已設定！\n\n📆 每{'、'.join(day_names)} {time_str}\n📝 {content}")
 
 
-# ── 地點功能 ─────────────────────────────────────────────────────────────────
+# ── 地點 ─────────────────────────────────────────────────────────────────────
 
-async def handle_location_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """收到位置訊息，進入等待命名狀態"""
+async def handle_location_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    loc = update.message.location
-    user_states[user_id] = {
-        "action": "await_location_name",
-        "lat": loc.latitude,
-        "lng": loc.longitude,
-    }
+    loc     = update.message.location
+    user_states[user_id] = {"action": "await_location_name",
+                             "lat": loc.latitude, "lng": loc.longitude}
     await update.message.reply_text(
-        "📍 收到位置！\n請輸入此地點的名稱（如：公司、家）：",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-
-async def handle_save_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                                user_id: int, text: str):
-    state = user_states.pop(user_id, {})
-    name = text.strip()
-    ok = add_location(user_id, name, state["lat"], state["lng"])
-    if ok:
-        await reply(update, f"✅ 地點「{name}」已儲存！")
-    else:
-        await reply(update, f"⚠️ 地點「{name}」已存在。")
-
+        "📍 收到位置！請輸入地點名稱（如：公司、家）：",
+        reply_markup=ReplyKeyboardRemove())
 
 async def handle_location_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    locs = get_locations(user_id)
+    locs    = get_locations(user_id)
     if not locs:
-        await reply(update, "📍 還沒有儲存任何地點。\n請傳送 Telegram 位置訊息來新增！")
+        await reply(update, "📍 沒有儲存地點。請傳送位置訊息來新增！")
         return
-    lines = ["📍 <b>我的地點</b>\n"]
+    lines   = ["📍 <b>我的地點</b>\n"]
     buttons = []
     for loc in locs:
         lines.append(f"• {loc.name}")
         buttons.append([
             InlineKeyboardButton(f"📌 {loc.name}", callback_data=f"loc:send:{loc.id}"),
-            InlineKeyboardButton("🗑️", callback_data=f"loc:del:{loc.name[:20]}"),
+            InlineKeyboardButton("🗑️", callback_data=f"loc:del:{loc.id}"),
         ])
     await reply(update, "\n".join(lines), InlineKeyboardMarkup(buttons))
 
-
-async def cb_location_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE, loc_id: int):
-    query = update.callback_query
-    await query.answer()
-    from db import SessionLocal, Location
-    db = SessionLocal()
-    loc = db.query(Location).filter(Location.id == loc_id).first()
+async def cb_loc_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE, loc_id: int):
+    q = update.callback_query
+    await q.answer()
+    from db import SessionLocal, Location as LocModel
+    db  = SessionLocal()
+    loc = db.query(LocModel).filter(LocModel.id == loc_id).first()
     db.close()
     if not loc:
-        await query.edit_message_text("❌ 找不到該地點。")
+        await q.edit_message_text("❌ 找不到該地點。")
         return
-    await ctx.bot.send_location(
-        chat_id=update.effective_chat.id,
-        latitude=loc.latitude,
-        longitude=loc.longitude,
-    )
-    await ctx.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=f"📍 {loc.name}"
-    )
+    await ctx.bot.send_location(update.effective_chat.id,
+                                latitude=loc.latitude, longitude=loc.longitude)
+    await ctx.bot.send_message(update.effective_chat.id, f"📍 {loc.name}")
 
-
-async def cb_location_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE, name: str):
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-    ok = delete_location(user_id, name)
-    if ok:
-        await query.edit_message_text(f"🗑️ 地點「{name}」已刪除。")
+async def cb_loc_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE, loc_id: int):
+    q = update.callback_query
+    await q.answer()
+    from db import SessionLocal, Location as LocModel
+    db  = SessionLocal()
+    loc = db.query(LocModel).filter(LocModel.id == loc_id).first()
+    if loc:
+        name = loc.name
+        db.delete(loc)
+        db.commit()
+        db.close()
+        await q.edit_message_text(f"🗑️ 地點「{name}」已刪除。")
     else:
-        await query.edit_message_text("❌ 找不到該地點。")
+        db.close()
+        await q.edit_message_text("❌ 找不到該地點。")
 
 
-# ── 記憶庫 ──────────────────────────────────────────────────────────────────
+# ── 記憶庫 ───────────────────────────────────────────────────────────────────
 
 async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     user_id = update.effective_user.id
-
     if text.startswith("記住"):
-        rest = text[2:].strip()
-        parts = rest.split(" ", 1)
+        parts = text[2:].strip().split(" ", 1)
         if len(parts) < 2:
             await reply(update, "格式：<code>記住 [關鍵字] [內容]</code>")
             return
         kw, content = parts
         if save_memory(user_id, kw, content):
-            await reply(update, f"🧠 已記住：\n<b>{kw}</b> → {content}")
+            await reply(update, f"🧠 已記住：<b>{kw}</b>\n{content}")
         else:
             await reply(update, "❌ 儲存失敗。")
-
     elif text.startswith("查詢"):
-        kw = text[2:].strip()
+        kw      = text[2:].strip()
         results = query_memory(user_id, kw)
         if not results:
             await reply(update, f"🔍 找不到「{kw}」的記憶。")
         elif len(results) == 1:
             await reply(update, f"🧠 <b>{results[0].keyword}</b>\n{results[0].content}")
         else:
-            # 多筆結果 → 列表選擇
-            lines = ["🔍 找到多筆記憶，請選擇："]
-            btns = [[InlineKeyboardButton(m.keyword, callback_data=f"mem:view:{m.keyword}")]
+            btns = [[InlineKeyboardButton(m.keyword, callback_data=f"mem:view:{m.id}")]
                     for m in results]
-            await reply(update, "\n".join(lines), InlineKeyboardMarkup(btns))
-
+            await reply(update, "🔍 找到多筆，請選擇：", InlineKeyboardMarkup(btns))
     elif text.startswith("忘記"):
         kw = text[2:].strip()
         if forget_memory(user_id, kw):
             await reply(update, f"🗑️ 已忘記「{kw}」。")
         else:
             await reply(update, f"❌ 找不到「{kw}」。")
-
     elif text == "記憶清單":
         mems = list_memories(user_id)
         if not mems:
@@ -602,79 +453,30 @@ async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: st
             lines = ["🧠 <b>記憶清單</b>\n"] + [f"• {m.keyword}" for m in mems]
             await reply(update, "\n".join(lines))
 
-
-async def cb_memory_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE, keyword: str):
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-    results = query_memory(user_id, keyword)
-    for m in results:
-        if m.keyword == keyword:
-            await query.edit_message_text(f"🧠 <b>{m.keyword}</b>\n{m.content}",
-                                          parse_mode=ParseMode.HTML)
-            return
-    await query.edit_message_text("❌ 找不到。")
-
-
-# ── 信用卡 ──────────────────────────────────────────────────────────────────
-
-async def handle_credit_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
-    user_id = update.effective_user.id
-
-    if text.startswith("新增卡片"):
-        name = text[4:].strip()
-        if not name:
-            await reply(update, "格式：<code>新增卡片 [名稱]</code>")
-            return
-        if add_user_card(user_id, name):
-            await reply(update, f"💳 已新增卡片：{name}")
-        else:
-            await reply(update, f"⚠️ 「{name}」已存在。")
-
-    elif text.startswith("刪除卡片"):
-        name = text[4:].strip()
-        if delete_user_card(user_id, name):
-            await reply(update, f"🗑️ 已刪除：{name}")
-        else:
-            await reply(update, f"❌ 找不到卡片「{name}」。")
-
-    elif text == "我的卡包":
-        cards = get_user_cards(user_id)
-        if cards:
-            lines = "\n".join([f"💳 {c}" for c in cards])
-            await reply(update, f"💳 <b>我的卡包</b>\n\n{lines}")
-        else:
-            await reply(update, "💳 還沒有任何卡片。\n請輸入：<code>新增卡片 [名稱]</code>")
-
-    elif text.startswith("刷 ") or text.startswith("刷"):
-        merchant = text.lstrip("刷").strip()
-        if not merchant:
-            await reply(update, "格式：<code>刷 [商家名稱]</code>")
-            return
-        msg = await reply(update, f"🔍 正在查詢「{merchant}」最佳刷卡策略…")
-        # 在 executor 裡跑（避免 block event loop）
-        result = await ctx.application.loop.run_in_executor(
-            None, analyze_best_card, str(user_id), merchant
-        )
-        await update.effective_message.reply_text(result, parse_mode=ParseMode.HTML)
+async def cb_mem_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mem_id: int):
+    q = update.callback_query
+    await q.answer()
+    from db import SessionLocal, Memory as MemModel
+    db  = SessionLocal()
+    mem = db.query(MemModel).filter(MemModel.id == mem_id).first()
+    db.close()
+    if mem:
+        await q.edit_message_text(f"🧠 <b>{mem.keyword}</b>\n{mem.content}",
+                                   parse_mode=ParseMode.HTML)
+    else:
+        await q.edit_message_text("❌ 找不到。")
 
 
 # ── 主訊息 Handler ────────────────────────────────────────────────────────────
 
-TIME_KEYWORDS = ["明天", "後天", "今天", "下週", "下周", "禮拜", "星期",
-                 "點", "分", "早上", "下午", "晚上", "中午", "半",
-                 "提醒", "幫我", "記得", "後"]
-
-
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-
-    text = update.message.text.strip()
+    text    = update.message.text.strip()
     user_id = update.effective_user.id
-    is_grp = is_group(update)
+    grp     = is_group(update)
 
-    # ── 1. 取消 ────────────────────────────────────────────────────────────
+    # 取消
     if text == "取消":
         if user_id in user_states:
             del user_states[user_id]
@@ -683,62 +485,57 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await reply(update, "目前沒有進行中的操作。")
         return
 
-    # ── 2. 狀態機（進行中的流程）──────────────────────────────────────────
+    # 狀態機
     if user_id in user_states:
-        state = user_states[user_id]
-        action = state.get("action")
-
+        action = user_states[user_id].get("action")
         if action == "await_location_name":
-            await handle_save_location(update, ctx, user_id, text)
+            state = user_states.pop(user_id)
+            if add_location(user_id, text.strip(), state["lat"], state["lng"]):
+                await reply(update, f"✅ 地點「{text.strip()}」已儲存！")
+            else:
+                await reply(update, f"⚠️ 地點「{text.strip()}」已存在。")
             return
         elif action == "recurring_set_time":
-            await handle_recurring_time(update, ctx, user_id, text)
+            import re
+            m = re.match(r"^(\d{1,2}):(\d{2})$", text.strip())
+            if not m:
+                await reply(update, "❌ 格式錯誤，請輸入 HH:MM，如 09:00")
+                return
+            h, minute = int(m.group(1)), int(m.group(2))
+            user_states[user_id]["time"]   = f"{h:02d}:{minute:02d}"
+            user_states[user_id]["action"] = "recurring_input_content"
+            await reply(update, "📝 請輸入提醒事項內容：")
             return
         elif action == "recurring_input_content":
-            await handle_recurring_content(update, ctx, user_id, text)
+            time_str = user_states[user_id].get("time", "09:00")
+            await _finish_recurring(update, ctx, user_id, time_str, text.strip())
             return
         elif action == "edit_reminder_content":
-            event_id = state["event_id"]
-            original = state["original"]
+            event_id = user_states[user_id]["event_id"]
+            original = user_states[user_id]["original"]
             if text.startswith("+") or text.startswith("＋"):
-                new_content = f"{original} ({text[1:].strip()})"
-                mode = "補充"
+                new_content, mode = f"{original} ({text[1:].strip()})", "補充"
             else:
-                new_content = text
-                mode = "修改"
+                new_content, mode = text, "修改"
+            del user_states[user_id]
             if update_event_content(event_id, new_content):
-                del user_states[user_id]
-                await reply(update, f"✅ 已{mode}提醒內容：\n{new_content}")
+                await reply(update, f"✅ 已{mode}提醒：\n{new_content}")
             else:
                 await reply(update, "❌ 更新失敗。")
             return
 
-    # ── 3. 信用卡指令 ───────────────────────────────────────────────────────
-    if any(text.startswith(kw) for kw in ["新增卡片", "刪除卡片", "我的卡包", "刷 ", "刷"]):
-        await handle_credit_card(update, ctx, text)
-        return
-
-    # ── 4. 提醒指令 ─────────────────────────────────────────────────────────
+    # 固定指令路由
     if text == "提醒清單":
-        await handle_reminder_list(update, ctx)
-        return
-    if text.startswith("重要提醒"):
-        await handle_reminder(update, ctx, text)
-        return
-    if text.startswith("提醒"):
-        await handle_reminder(update, ctx, text)
-        return
+        await handle_reminder_list(update, ctx); return
+    if text.startswith("重要提醒") or text.startswith("提醒"):
+        await handle_reminder(update, ctx, text); return
     if text == "週期提醒":
-        await handle_recurring(update, ctx)
-        return
-
-    # ── 5. 地點指令 ─────────────────────────────────────────────────────────
+        await handle_recurring(update, ctx); return
     if text in ("地點", "地點清單"):
-        await handle_location_list(update, ctx)
-        return
+        await handle_location_list(update, ctx); return
     if text.startswith("找地點"):
         name = text[3:].strip()
-        loc = get_location_by_name(user_id, name)
+        loc  = get_location_by_name(user_id, name)
         if loc:
             await ctx.bot.send_location(update.effective_chat.id,
                                         latitude=loc.latitude, longitude=loc.longitude)
@@ -753,185 +550,148 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await reply(update, f"❌ 找不到「{name}」。")
         return
-
-    # ── 6. 記憶指令 ─────────────────────────────────────────────────────────
-    if any(text.startswith(kw) for kw in ["記住", "查詢", "忘記"]) or text == "記憶清單":
-        await handle_memory(update, ctx, text)
-        return
-
-    # ── 7. 說明 ─────────────────────────────────────────────────────────────
+    if any(text.startswith(k) for k in ["記住", "查詢", "忘記"]) or text == "記憶清單":
+        await handle_memory(update, ctx, text); return
     if text.lower() in ("help", "說明", "幫助"):
-        await cmd_help(update, ctx)
-        return
+        await cmd_help(update, ctx); return
 
-    # ── 8. AI 自然語言解析（僅含時間關鍵字才觸發）────────────────────────────
-    has_time_hint = any(k in text for k in TIME_KEYWORDS) or any(c.isdigit() for c in text)
-    if len(text) > 1 and has_time_hint:
-        try:
-            cur_time = now_taipei().strftime("%Y-%m-%d %H:%M:%S")
-            result = await ctx.application.loop.run_in_executor(
-                None, parse_natural_language, text, cur_time
-            )
-            if result:
-                from datetime import datetime as dt_cls
-                naive = dt_cls.strptime(result["event_datetime"], "%Y-%m-%d %H:%M")
-                event_dt = TAIPEI_TZ.localize(naive)
-
-                if event_dt <= now_taipei():
-                    await reply(update, "😅 AI 解析出的時間已過，請再說一次。")
-                    return
-
-                display = update.effective_user.first_name or "您"
-                chat_id = str(update.effective_chat.id)
-                content = result["event_content"]
-
-                event_id = add_event(
-                    creator_user_id=user_id,
-                    target_id=chat_id,
-                    target_type=chat_type(update),
-                    display_name=display,
-                    content=content,
-                    event_datetime=event_dt,
-                )
-                if event_id:
-                    safe_add_job(send_reminder, event_dt, [event_id], f"reminder_{event_id}")
-                    await reply(update,
-                                f"🤖 AI 已幫您設定提醒！\n\n"
-                                f"📅 {event_dt.strftime('%Y/%m/%d %H:%M')}\n"
-                                f"📝 {content}",
-                                kb([("✅ 確認", f"cr:{event_id}"),
-                                    ("🗑️ 刪除", f"re:del:{event_id}")]))
-                    return
-        except Exception as e:
-            logger.error(f"AI parse failed: {e}")
-
-    # ── 9. 群組靜默 / 私訊才回饋 ─────────────────────────────────────────────
-    if not is_grp:
-        await reply(update, "🤔 我聽不懂，請輸入「說明」查看指令列表。")
+    # 群組靜默，私訊才提示
+    if not grp:
+        await reply(update, "🤔 我聽不懂，輸入「說明」查看指令。")
 
 
-# ── Callback Query Handler（統一入口）──────────────────────────────────────────
+# ── Callback 統一入口 ─────────────────────────────────────────────────────────
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-
+    q    = update.callback_query
+    data = q.data
     try:
-        # cancel
         if data == "cancel":
-            user_id = update.effective_user.id
-            user_states.pop(user_id, None)
-            await query.answer("已取消")
-            await query.edit_message_text("❌ 操作已取消。")
+            user_states.pop(update.effective_user.id, None)
+            await q.answer("已取消")
+            await q.edit_message_text("❌ 操作已取消。")
             return
-
         parts = data.split(":")
-
-        # ── 提醒確認 / 延後 cr:id  sn:id:min ───────────────────────────────
         if parts[0] == "cr":
-            await cb_confirm_reminder(update, ctx, int(parts[1]))
-
+            await cb_confirm(update, ctx, int(parts[1]))
         elif parts[0] == "sn":
             await cb_snooze(update, ctx, int(parts[1]), int(parts[2]))
-
-        # ── 重要提醒優先等級 prio:level ──────────────────────────────────────
         elif parts[0] == "prio":
-            await handle_priority_callback(update, ctx, data)
-
-        # ── 提醒清單操作 re:action:id ────────────────────────────────────────
+            await cb_priority(update, ctx, int(parts[1]))
         elif parts[0] == "re":
             action = parts[1]
-            if action == "page":
-                await handle_reminder_list(update, ctx, int(parts[2]))
-            elif action == "del":
-                await cb_delete_reminder(update, ctx, int(parts[2]))
-            elif action == "delok":
-                await cb_delete_ok(update, ctx, int(parts[2]))
-            elif action == "edit":
-                await cb_edit_reminder(update, ctx, int(parts[2]))
-
-        # ── 週期提醒 rec:action[:day] ────────────────────────────────────────
+            if action == "page":   await handle_reminder_list(update, ctx, int(parts[2]))
+            elif action == "del":  await cb_delete_prompt(update, ctx, int(parts[2]))
+            elif action == "delok":await cb_delete_ok(update, ctx, int(parts[2]))
+            elif action == "edit": await cb_edit_prompt(update, ctx, int(parts[2]))
         elif parts[0] == "rec":
-            action = parts[1]
-            if action == "toggle":
-                await cb_recurring_toggle(update, ctx, parts[2])
-            elif action == "settime":
-                await cb_recurring_settime(update, ctx)
-
-        # ── 地點 loc:action:id_or_name ───────────────────────────────────────
+            if parts[1] == "toggle":  await cb_rec_toggle(update, ctx, parts[2])
+            elif parts[1] == "settime": await cb_rec_settime(update, ctx)
         elif parts[0] == "loc":
-            action = parts[1]
-            if action == "send":
-                await cb_location_send(update, ctx, int(parts[2]))
-            elif action == "del":
-                await cb_location_delete(update, ctx, parts[2])
-
-        # ── 記憶庫 mem:view:keyword ──────────────────────────────────────────
+            if parts[1] == "send": await cb_loc_send(update, ctx, int(parts[2]))
+            elif parts[1] == "del":await cb_loc_del(update, ctx, int(parts[2]))
         elif parts[0] == "mem":
-            if parts[1] == "view":
-                await cb_memory_view(update, ctx, parts[2])
-
+            if parts[1] == "view": await cb_mem_view(update, ctx, int(parts[2]))
         else:
-            await query.answer("❓ 未知操作", show_alert=True)
-
+            await q.answer("❓ 未知操作", show_alert=True)
     except Exception as e:
         logger.error(f"Callback error ({data}): {e}", exc_info=True)
         try:
-            await query.answer("❌ 發生錯誤", show_alert=True)
+            await q.answer("❌ 發生錯誤", show_alert=True)
         except Exception:
             pass
 
 
-# ── 主程式 ────────────────────────────────────────────────────────────────────
+# ── PTB Application ───────────────────────────────────────────────────────────
 
-def main():
-    import asyncio
-
-    # 環境變數檢查
-    print("=" * 50)
-    for key in ["TELEGRAM_BOT_TOKEN", "DATABASE_URL", "GOOGLE_API_KEY",
-                "GOOGLE_SEARCH_ENGINE_ID", "WEBHOOK_URL"]:
-        val = os.environ.get(key)
-        status = f"✅ 存在（長度 {len(val)}）" if val else "❌ 缺少！"
-        print(f"{key}: {status}")
-    print("=" * 50)
-
-    # DB 初始化
-    init_db()
-
-    # 排程器啟動
-    safe_start()
-
-    # PTB Application
+def build_ptb_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # 指令 handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
-
-    # 位置訊息
-    app.add_handler(MessageHandler(filters.LOCATION, handle_location_message))
-
-    # 文字訊息
+    app.add_handler(MessageHandler(filters.LOCATION, handle_location_msg))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    # Callback（按鈕點擊）
     app.add_handler(CallbackQueryHandler(handle_callback))
+    return app
 
-    # 啟動 webhook 或 polling（本機開發用 polling，Fly.io 用 webhook）
-    if WEBHOOK_URL:
-        logger.info(f"Starting webhook at {WEBHOOK_URL}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=int(os.environ.get("PORT", 8080)),
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
-            secret_token=os.environ.get("WEBHOOK_SECRET", ""),
+
+# ── FastAPI（生產環境）────────────────────────────────────────────────────────
+
+ptb_app: Application = None
+
+@asynccontextmanager
+async def lifespan(web: FastAPI):
+    global ptb_app
+
+    # 啟動診斷
+    logger.info("=" * 50)
+    for key in ["TELEGRAM_BOT_TOKEN", "DATABASE_URL", "GOOGLE_API_KEY",
+                "GOOGLE_SEARCH_ENGINE_ID", "WEBHOOK_URL"]:
+        val = os.environ.get(key, "")
+        logger.info(f"  {key}: {'✅ OK' if val else '❌ MISSING'}")
+    logger.info("=" * 50)
+
+    init_db()
+    safe_start()
+
+    ptb_app = build_ptb_app()
+    await ptb_app.initialize()
+    await ptb_app.start()
+
+    if WEBHOOK_URL and BOT_TOKEN:
+        webhook_full = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+        await ptb_app.bot.set_webhook(
+            url=webhook_full,
             allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
         )
+        logger.info(f"✅ Webhook 已設定：{webhook_full}")
     else:
-        logger.info("Starting polling (local dev)...")
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
+        logger.warning("⚠️ WEBHOOK_URL 未設定")
+
+    yield
+
+    await ptb_app.stop()
+    await ptb_app.shutdown()
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+
+web_app = FastAPI(lifespan=lifespan)
+
+@web_app.post("/{token}")
+async def telegram_webhook(token: str, request: Request):
+    if token != BOT_TOKEN:
+        return Response(status_code=403)
+    data   = await request.json()
+    update = Update.de_json(data, ptb_app.bot)
+    await ptb_app.process_update(update)
+    return Response(content="OK")
+
+@web_app.get("/health")
+def health():
+    return {"status": "ok", "scheduler": scheduler.running, "bot": ptb_app is not None}
+
+@web_app.get("/")
+def root():
+    return {"service": "TG Reminder Bot", "status": "running"}
+
+
+# ── 本機 polling 模式 ─────────────────────────────────────────────────────────
+
+async def run_polling():
+    import asyncio
+    init_db()
+    safe_start()
+    app = build_ptb_app()
+    logger.info("🔄 Polling 模式（本機開發）...")
+    async with app:
+        await app.start()
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    main()
+    if WEBHOOK_URL:
+        uvicorn.run("bot:web_app", host="0.0.0.0", port=PORT, log_level="info")
+    else:
+        import asyncio
+        asyncio.run(run_polling())

@@ -12,4 +12,4 @@ COPY . .
 # 使用 PORT 環境變數（Fly.io 預設 8080）
 ENV PORT=8080
 
-CMD ["python", "bot.py"]
+CMD ["uvicorn", "bot:web_app", "--host", "0.0.0.0", "--port", "8080"]
