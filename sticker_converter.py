@@ -128,7 +128,8 @@ async def convert_and_upload(bot, user_id: int, chat_id: int | str,
 
     has_animated   = any(s["is_animated"] for s in stickers_data)
     file_type_text = "動態" if has_animated else "靜態"
-    pack_type_name = "表情貼" if is_emoji else "貼圖"
+    # custom_emoji 已鎖付費，emoji 包也轉成普通貼圖
+    pack_type_name = "表情貼（轉貼圖）" if is_emoji else "貼圖"
 
     await status_msg.edit_text(
         f"✅ 找到 {len(stickers_data)} 張 {file_type_text}{pack_type_name}！開始轉換...\n"
@@ -136,20 +137,23 @@ async def convert_and_upload(bot, user_id: int, chat_id: int | str,
     )
 
     bot_username = (await bot.get_me()).username
-    pack_name    = f"{'emoji_' if is_emoji else 'sticker_'}{int(time.time())}_by_{bot_username}"
-    pack_title   = f"來自 LINE 的{file_type_text}{pack_type_name}"
-    pack_type    = "custom_emoji" if is_emoji else "regular"
+    pack_name  = f"{'emoji_' if is_emoji else 'sticker_'}{int(time.time())}_by_{bot_username}"
+    pack_title = f"來自 LINE 的{file_type_text}{pack_type_name}"
+
+    loop = asyncio.get_event_loop()
 
     for i, s in enumerate(stickers_data):
         res = requests.get(s["url"], timeout=15)
         if res.status_code != 200:
             res = requests.get(s["url"].replace("@2x", ""), timeout=15)
 
+        content = res.content
         if s["is_animated"]:
-            processed = resize_for_emoji(res.content) if is_emoji else convert_to_webm(res.content)
-            fmt = "static" if is_emoji else "video"
+            # ffmpeg 是 CPU 密集，用 executor 避免阻塞 event loop
+            processed = await loop.run_in_executor(None, convert_to_webm, content)
+            fmt = "video"
         else:
-            processed = resize_for_emoji(res.content) if is_emoji else resize_for_telegram(res.content)
+            processed = await loop.run_in_executor(None, resize_for_telegram, content)
             fmt = "static"
 
         if not processed:
@@ -160,12 +164,12 @@ async def convert_and_upload(bot, user_id: int, chat_id: int | str,
         if i == 0:
             await bot.create_new_sticker_set(
                 user_id=user_id, name=pack_name, title=pack_title,
-                stickers=[sticker], sticker_type=pack_type,
+                stickers=[sticker], sticker_type="regular",
             )
         else:
             await bot.add_sticker_to_set(user_id=user_id, name=pack_name, sticker=sticker)
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
 
         if (i + 1) % 5 == 0:
             await status_msg.edit_text(

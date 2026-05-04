@@ -769,17 +769,21 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if "store.line.me" in text and user_id in sticker_users:
         status = await update.message.reply_text("🔍 正在抓取 LINE 網頁資料...")
-        try:
-            link = await convert_and_upload(
-                ctx.bot, user_id, update.effective_chat.id, text.strip(), status
-            )
-            if link:
-                await status.edit_text(f"🎉 轉換完成！\n👉 {link}")
-            else:
-                await status.edit_text("❌ 找不到貼圖資料，請確認網址是否正確。")
-        except Exception as e:
-            logger.error(f"sticker convert: {e}", exc_info=True)
-            await status.edit_text(f"❌ 發生錯誤：{e}")
+
+        async def _bg_convert():
+            try:
+                link = await convert_and_upload(
+                    ctx.bot, user_id, update.effective_chat.id, text.strip(), status
+                )
+                if link:
+                    await status.edit_text(f"🎉 轉換完成！\n👉 {link}")
+                else:
+                    await status.edit_text("❌ 找不到貼圖資料，請確認網址是否正確。")
+            except Exception as e:
+                logger.error(f"sticker convert: {e}", exc_info=True)
+                await status.edit_text(f"❌ 發生錯誤：{e}")
+
+        asyncio.create_task(_bg_convert())  # 背景執行，webhook 立即 return
         return
     if text == "提醒清單":
         await handle_reminder_list(update, ctx); return
