@@ -43,7 +43,7 @@ app = Flask(__name__)
 _loop: asyncio.AbstractEventLoop = None
 _ptb_app: Application = None
 user_states: dict[int, dict] = {}
-sticker_users: set[int] = set()   # 已開啟貼圖轉換模式的 user_id
+sticker_users: set[int] = set()  # 已開啟貼圖轉換模式的 user_id
 
 
 # ── asyncio bridge ────────────────────────────────────────────────────────────
@@ -180,7 +180,7 @@ HELP_TEXT = """🤖 <b>Telegram 智慧管家</b>
 
 <b>📅 提醒功能</b>
 <code>提醒 [誰] [日期] [時間] [事件]</code>
-<i>日期可用：今天 / 明天 / 後天 / MM/DD / YYYY-MM-DD</i>
+<i>日期可用：今天 / 明天 / 後天 / MM/DD / YYYY-MM-DD（空格可省略）</i>
 <code>重要提醒 [誰] [日期] [時間] [事件]</code>
 <code>週期提醒</code> — 設定每週重複
 <code>提醒清單</code> — 管理所有提醒
@@ -195,10 +195,29 @@ HELP_TEXT = """🤖 <b>Telegram 智慧管家</b>
 <code>查詢 [關鍵字]</code>
 <code>忘記 [關鍵字]</code> / <code>記憶清單</code>
 
+<b>🎨 LINE 貼圖轉換</b>
+<code>貼圖轉換</code> — 開啟／關閉轉換模式
+開啟後貼上 LINE 商店網址即自動轉換至 Telegram
+
 <b>通用</b>：<code>取消</code> — 中斷操作"""
 
+# 主選單鍵盤（同步 HELP_TEXT 功能，移除已棄用的卡包）
+_MAIN_KB_MARKUP = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📋 提醒清單", callback_data="menu:提醒清單"),
+     InlineKeyboardButton("🧠 記憶清單", callback_data="menu:記憶清單")],
+    [InlineKeyboardButton("📍 地點清單", callback_data="menu:地點清單"),
+     InlineKeyboardButton("🎨 貼圖轉換", callback_data="menu:貼圖轉換")],
+    [InlineKeyboardButton("❓ 說明",     callback_data="menu:說明")],
+])
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await reply(update, f"👋 歡迎使用 Telegram 智慧管家！\n\n{HELP_TEXT}")
+    # ReplyKeyboardRemove 清除舊版殘留的鍵盤
+    await update.message.reply_text(
+        f"👋 歡迎使用 Telegram 智慧管家！\n\n{HELP_TEXT}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await update.message.reply_text("請選擇功能：", reply_markup=_MAIN_KB_MARKUP)
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reply(update, HELP_TEXT)
@@ -815,6 +834,32 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         parts = data.split(":")
+
+        # ── 主選單按鈕（模擬使用者輸入對應指令）
+        if parts[0] == "menu":
+            await q.answer()
+            cmd = parts[1]
+            if cmd == "提醒清單":
+                await handle_reminder_list(update, ctx)
+            elif cmd == "記憶清單":
+                await handle_memory(update, ctx, "記憶清單")
+            elif cmd == "地點清單":
+                await handle_location_list(update, ctx)
+            elif cmd == "貼圖轉換":
+                uid = update.effective_user.id
+                if uid in sticker_users:
+                    sticker_users.discard(uid)
+                    await q.message.reply_text("🔴 貼圖轉換模式已關閉。")
+                else:
+                    sticker_users.add(uid)
+                    await q.message.reply_text(
+                        "🟢 貼圖轉換模式已開啟！\n"
+                        "請把 LINE 貼圖商店網址傳給我，例如：\n"
+                        "https://store.line.me/stickershop/product/XXXXX"
+                    )
+            elif cmd == "說明":
+                await q.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
+            return
 
         # ── 提醒確認 / 延後
         if parts[0] == "cr":
