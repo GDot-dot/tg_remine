@@ -78,50 +78,85 @@ def convert_to_webm(image_bytes: bytes) -> io.BytesIO | None:
 
 # ── 抓取 LINE 商店資料 ────────────────────────────────────────────────────────
 
-def _fetch_emojishop(url: str, soup: BeautifulSoup) -> list[dict] | None:
+def _fetch_emojishop(url: str) -> list[dict] | None:
     """
-    emojishop 頁面結構和 stickershop 不同。
-    先嘗試 data-preview，再從 CDN 直接建構網址。
+    emojishop 是 SPA，靜態 HTML 沒有 data-preview。
+    改走 LINE 內部 JSON API 拿貼圖清單。
     """
     import re as _re
 
-    # 方法一：data-preview（部分版本有效）
-    items = soup.find_all(attrs={"data-preview": True})
-    stickers = []
-    for item in items:
-        try:
-            data = json.loads(item["data-preview"])
-            img_url = data.get("staticUrl") or data.get("fallbackStaticUrl")
-            if img_url:
-                stickers.append({"url": img_url.split(";")[0], "is_animated": False})
-        except Exception:
-            continue
-    if stickers:
-        return stickers
-
-    # 方法二：從頁面 HTML 抓 product ID → CDN 直接建構
-    # emojishop CDN: https://stickershop.line-scdn.net/sticonshop/v1/sticon/{id}/iPhone/{n}.png
-    m = _re.search(r"/emojishop/product/([a-f0-9]+)", url)
+    m = _re.search(r"/emojishop/product/([^/]+)", url)
     if not m:
+        logger.error("emojishop: 無法解析 product ID")
         return None
     product_id = m.group(1)
+    logger.info(f"emojishop product_id: {product_id}")
 
-    # 從頁面找貼圖 ID 列表（li[data-id] 或 script 內的 stickerIds）
-    ids = [tag.get("data-id") for tag in soup.find_all(attrs={"data-id": True}) if tag.get("data-id")]
-    if not ids:
-        # 嘗試從 script 內找 JSON
-        for script in soup.find_all("script"):
-            if "stickerIds" in (script.string or ""):
-                found = _re.findall(r'"stickerIds"\s*:\s*\[([^\]]+)\]', script.string)
-                if found:
-                    ids = [i.strip().strip('"') for i in found[0].split(",")]
-                    break
+    # LINE 內部 API（JSON，不需 JS 執行）
+    api_url = f"https://store.line.me/api/v1/stickershop/products/{product_id}/info"
+    try:
+        res = requests.get(
+            api_url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+                "Referer": "https://store.line.me/",
+            },
+            timeout=15,
+        )
+        logger.info(f"emojishop API status: {res.status_code}, body[:300]: {res.text[:300]}")
 
-    if not ids:
-        return None
+        if res.status_code == 200:
+            data = res.json()
+            stickers = []
 
+            # 路徑因版本不同可能有差異，逐一嘗試
+            raw_list = (
+                data.get("stickers")
+                or data.get("stickerList")
+                or (data.get("package") or {}).get("stickers")
+                or []
+            )
+            for s in raw_list:
+                img_url = (
+                    s.get("animationUrl")
+                    or s.get("popupUrl")
+                    or s.get("staticUrl")
+                    or s.get("fallbackStaticUrl")
+                    or s.get("staticImageUrl")
+                )
+                if img_url:
+                    is_ani = bool(s.get("animationUrl") or s.get("popupUrl"))
+                    stickers.append({"url": img_url.split(";")[0], "is_animated": is_ani})
+
+            if stickers:
+                logger.info(f"emojishop: 透過 API 找到 {len(stickers)} 張")
+                return stickers
+
+            logger.warning(f"emojishop API 有回應但解析不到貼圖，完整 JSON keys: {list(data.keys())}")
+
+    except Exception as e:
+        logger.error(f"emojishop API 失敗: {e}")
+
+    # Fallback：CDN 流水號猜圖（適合部分舊包）
+    # 格式：sticonshop/v1/sticon/{id}/iPhone/{n}.png，先嘗試 1~40
+    logger.info("emojishop: 嘗試 CDN fallback")
     base = f"https://stickershop.line-scdn.net/sticonshop/v1/sticon/{product_id}/iPhone"
-    return [{"url": f"{base}/{sid}.png", "is_animated": False} for sid in ids if sid]
+    stickers = []
+    for n in range(1, 41):
+        stickers.append({"url": f"{base}/{n:03d}.png", "is_animated": False})
+    # 先驗第一張是否存在
+    try:
+        chk = requests.head(stickers[0]["url"], timeout=5)
+        if chk.status_code == 200:
+            logger.info("emojishop CDN fallback 有效")
+            return stickers
+        logger.warning(f"emojishop CDN fallback 無效 (status {chk.status_code})")
+    except Exception as e:
+        logger.error(f"emojishop CDN head 失敗: {e}")
+
+    return None
+
 
 
 def fetch_line_stickers(url: str) -> list[dict] | None:
