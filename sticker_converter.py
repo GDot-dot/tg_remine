@@ -93,7 +93,7 @@ def _fetch_emojishop(url: str) -> list[dict] | None:
     logger.info(f"emojishop product_id: {product_id}")
 
     # LINE 內部 API（JSON，不需 JS 執行）
-    api_url = f"https://store.line.me/api/v1/stickershop/products/{product_id}/info"
+    api_url = f"https://store.line.me/api/v1/sticonshop/products/{product_id}/info"
     try:
         res = requests.get(
             api_url,
