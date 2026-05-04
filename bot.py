@@ -29,6 +29,7 @@ from scheduler import (
     scheduler, safe_start, safe_add_job, safe_add_cron,
     remove_job, send_reminder, TAIPEI_TZ, PRIORITY_RULES,
 )
+from sticker_converter import convert_and_upload
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -42,6 +43,7 @@ app = Flask(__name__)
 _loop: asyncio.AbstractEventLoop = None
 _ptb_app: Application = None
 user_states: dict[int, dict] = {}
+sticker_users: set[int] = {}   # 已開啟貼圖轉換模式的 user_id
 
 
 # ── asyncio bridge ────────────────────────────────────────────────────────────
@@ -205,7 +207,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── 提醒解析（對齊 LINE regex 邏輯）─────────────────────────────────────────
 
 _REMINDER_RE = re.compile(
-    r"^(?:提醒|重要提醒)(.*?)\s+"          # 前綴 + 誰（可空）
+    r"^(?:提醒|重要提醒)(.*?)\s*"           # 前綴 + 誰（可空，空格可選）
     r"(今天|明天|後天|\d{1,4}[/\-]\d{1,2}(?:[/\-]\d{2,4})?)"  # 日期
     r"\s*(\d{1,2}:\d{2})?"                # 時間（可選）
     r"\s*(.+)$"                           # 事件內容
@@ -735,6 +737,31 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
     # 固定指令路由
+    if text == "貼圖轉換":
+        if user_id in sticker_users:
+            sticker_users.discard(user_id)
+            await reply(update, "🔴 貼圖轉換模式已關閉。")
+        else:
+            sticker_users.add(user_id)
+            await reply(update,
+                "🟢 貼圖轉換模式已開啟！\n"
+                "請把 LINE 貼圖商店網址傳給我，例如：\n"
+                "https://store.line.me/stickershop/product/XXXXX")
+        return
+    if "store.line.me" in text and user_id in sticker_users:
+        status = await update.message.reply_text("🔍 正在抓取 LINE 網頁資料...")
+        try:
+            link = await convert_and_upload(
+                ctx.bot, user_id, update.effective_chat.id, text.strip(), status
+            )
+            if link:
+                await status.edit_text(f"🎉 轉換完成！\n👉 {link}")
+            else:
+                await status.edit_text("❌ 找不到貼圖資料，請確認網址是否正確。")
+        except Exception as e:
+            logger.error(f"sticker convert: {e}", exc_info=True)
+            await status.edit_text(f"❌ 發生錯誤：{e}")
+        return
     if text == "提醒清單":
         await handle_reminder_list(update, ctx); return
     if text.startswith("重要提醒"):
