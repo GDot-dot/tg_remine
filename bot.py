@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request
 
 import pytz
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters,
@@ -201,23 +201,23 @@ HELP_TEXT = """🤖 <b>Telegram 智慧管家</b>
 
 <b>通用</b>：<code>取消</code> — 中斷操作"""
 
-# 主選單鍵盤（同步 HELP_TEXT 功能，移除已棄用的卡包）
-_MAIN_KB_MARKUP = InlineKeyboardMarkup([
-    [InlineKeyboardButton("📋 提醒清單", callback_data="menu:提醒清單"),
-     InlineKeyboardButton("🧠 記憶清單", callback_data="menu:記憶清單")],
-    [InlineKeyboardButton("📍 地點清單", callback_data="menu:地點清單"),
-     InlineKeyboardButton("🎨 貼圖轉換", callback_data="menu:貼圖轉換")],
-    [InlineKeyboardButton("❓ 說明",     callback_data="menu:說明")],
-])
+# 浮動快捷鍵盤（Reply Keyboard）
+_REPLY_KB = ReplyKeyboardMarkup(
+    [
+        ["📋 提醒清單", "🧠 記憶清單"],
+        ["📍 地點清單", "🎨 貼圖轉換"],
+        ["❓ 說明"],
+    ],
+    resize_keyboard=True,
+    persistent=True,
+)
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # ReplyKeyboardRemove 清除舊版殘留的鍵盤
     await update.message.reply_text(
         f"👋 歡迎使用 Telegram 智慧管家！\n\n{HELP_TEXT}",
         parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=_REPLY_KB,
     )
-    await update.message.reply_text("請選擇功能：", reply_markup=_MAIN_KB_MARKUP)
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reply(update, HELP_TEXT)
@@ -756,7 +756,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
     # 固定指令路由
-    if text == "貼圖轉換":
+    if text in ("貼圖轉換", "🎨 貼圖轉換"):
         if user_id in sticker_users:
             sticker_users.discard(user_id)
             await reply(update, "🔴 貼圖轉換模式已關閉。")
@@ -785,7 +785,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         asyncio.create_task(_bg_convert())  # 背景執行，webhook 立即 return
         return
-    if text == "提醒清單":
+    if text in ("提醒清單", "📋 提醒清單"):
         await handle_reminder_list(update, ctx); return
     if text.startswith("重要提醒"):
         await handle_priority_reminder(update, ctx, text); return
@@ -793,7 +793,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_reminder(update, ctx, text); return
     if text == "週期提醒":
         await handle_recurring(update, ctx); return
-    if text in ("地點", "地點清單"):
+    if text in ("地點", "地點清單", "📍 地點清單"):
         await handle_location_list(update, ctx); return
     if text.startswith("找地點"):
         name = text[3:].strip()
@@ -812,9 +812,11 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await reply(update, f"❌ 找不到「{name}」。")
         return
-    if any(text.startswith(k) for k in ["記住", "查詢", "忘記"]) or text == "記憶清單":
-        await handle_memory(update, ctx, text); return
-    if text.lower() in ("help", "說明", "幫助"):
+    if any(text.startswith(k) for k in ["記住", "查詢", "忘記"]) or text in ("記憶清單", "🧠 記憶清單"):
+        # 把 emoji 前綴去掉再傳入
+        clean = text.removeprefix("🧠 ")
+        await handle_memory(update, ctx, clean); return
+    if text.lower() in ("help", "說明", "幫助", "❓ 說明"):
         await cmd_help(update, ctx); return
 
     # 群組靜默，私訊才提示

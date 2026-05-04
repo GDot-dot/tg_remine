@@ -78,6 +78,52 @@ def convert_to_webm(image_bytes: bytes) -> io.BytesIO | None:
 
 # ── 抓取 LINE 商店資料 ────────────────────────────────────────────────────────
 
+def _fetch_emojishop(url: str, soup: BeautifulSoup) -> list[dict] | None:
+    """
+    emojishop 頁面結構和 stickershop 不同。
+    先嘗試 data-preview，再從 CDN 直接建構網址。
+    """
+    import re as _re
+
+    # 方法一：data-preview（部分版本有效）
+    items = soup.find_all(attrs={"data-preview": True})
+    stickers = []
+    for item in items:
+        try:
+            data = json.loads(item["data-preview"])
+            img_url = data.get("staticUrl") or data.get("fallbackStaticUrl")
+            if img_url:
+                stickers.append({"url": img_url.split(";")[0], "is_animated": False})
+        except Exception:
+            continue
+    if stickers:
+        return stickers
+
+    # 方法二：從頁面 HTML 抓 product ID → CDN 直接建構
+    # emojishop CDN: https://stickershop.line-scdn.net/sticonshop/v1/sticon/{id}/iPhone/{n}.png
+    m = _re.search(r"/emojishop/product/([a-f0-9]+)", url)
+    if not m:
+        return None
+    product_id = m.group(1)
+
+    # 從頁面找貼圖 ID 列表（li[data-id] 或 script 內的 stickerIds）
+    ids = [tag.get("data-id") for tag in soup.find_all(attrs={"data-id": True}) if tag.get("data-id")]
+    if not ids:
+        # 嘗試從 script 內找 JSON
+        for script in soup.find_all("script"):
+            if "stickerIds" in (script.string or ""):
+                found = _re.findall(r'"stickerIds"\s*:\s*\[([^\]]+)\]', script.string)
+                if found:
+                    ids = [i.strip().strip('"') for i in found[0].split(",")]
+                    break
+
+    if not ids:
+        return None
+
+    base = f"https://stickershop.line-scdn.net/sticonshop/v1/sticon/{product_id}/iPhone"
+    return [{"url": f"{base}/{sid}.png", "is_animated": False} for sid in ids if sid]
+
+
 def fetch_line_stickers(url: str) -> list[dict] | None:
     """
     回傳 [{'url': str, 'is_animated': bool}, ...]
@@ -86,6 +132,11 @@ def fetch_line_stickers(url: str) -> list[dict] | None:
     try:
         res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         soup = BeautifulSoup(res.text, "html.parser")
+
+        # emojishop 走專用解析
+        if "emojishop" in url:
+            return _fetch_emojishop(url, soup)
+
         items = soup.find_all(attrs={"data-preview": True})
         if not items:
             return None
@@ -93,11 +144,11 @@ def fetch_line_stickers(url: str) -> list[dict] | None:
         stickers = []
         for item in items:
             data = json.loads(item["data-preview"])
-            ani_url     = data.get("animationUrl")
-            popup_url   = data.get("popupUrl")
-            stat_url    = data.get("staticUrl")
-            fallback    = data.get("animation")
-            img_url     = ani_url or popup_url or fallback or stat_url
+            ani_url   = data.get("animationUrl")
+            popup_url = data.get("popupUrl")
+            stat_url  = data.get("staticUrl")
+            fallback  = data.get("animation")
+            img_url   = ani_url or popup_url or fallback or stat_url
             if not img_url:
                 continue
             img_url = (img_url
