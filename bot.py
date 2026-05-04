@@ -1,19 +1,18 @@
-# bot.py - Telegram AI 智慧管家（FastAPI + uvicorn + PTB v20/21）
+# bot.py - Telegram 智慧管家（Flask + Gunicorn，對齊原 LINE 專案架構）
 #
-# FastAPI 負責 HTTP 綁定（讓 Fly.io smoke check 通過），
-# PTB Application 處理 bot 邏輯，兩者共用同一 asyncio event loop。
+# 架構：Flask 處理 HTTP（Gunicorn 啟動），PTB async 跑在背景 event loop thread
 
 import os
+import re
+import threading
+import asyncio
 import logging
-from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from flask import Flask, request, abort
 
 import pytz
-import uvicorn
-from fastapi import FastAPI, Request, Response
 from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardRemove,
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove,
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -34,17 +33,30 @@ from scheduler import (
     remove_job, send_reminder, TAIPEI_TZ, PRIORITY_RULES,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")  # 完整含路徑，如 https://xxx.fly.dev/bot
 PORT        = int(os.environ.get("PORT", 8080))
 
+app = Flask(__name__)
+
+# ── PTB async 跑在獨立 thread ─────────────────────────────────────────────────
+_loop: asyncio.AbstractEventLoop = None
+_ptb_app: Application = None
 user_states: dict[int, dict] = {}
+
+
+def _run_event_loop(loop: asyncio.AbstractEventLoop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+def _async(coro):
+    """在 PTB event loop 裡執行 coroutine（供 Flask sync thread 呼叫）"""
+    return asyncio.run_coroutine_threadsafe(coro, _loop).result(timeout=30)
 
 
 # ── 鍵盤工具 ─────────────────────────────────────────────────────────────────
@@ -81,11 +93,11 @@ def reminder_list_kb(events: list, page: int = 0, page_size: int = 5):
         if ev.is_recurring:
             line = f"🔁 {ev.event_content} [{ev.recurrence_rule}]"
         else:
-            rt      = ev.reminder_time.astimezone(TAIPEI_TZ)
+            rt       = ev.reminder_time.astimezone(TAIPEI_TZ)
             snoozing = ev.reminder_time != ev.event_datetime
-            icon    = "💤" if snoozing else "⏰"
-            prefix  = "(延) " if snoozing else ""
-            line    = f"{icon} {rt.strftime('%m/%d %H:%M')} {prefix}{ev.event_content}"
+            icon     = "💤" if snoozing else "⏰"
+            prefix   = "(延) " if snoozing else ""
+            line     = f"{icon} {rt.strftime('%m/%d %H:%M')} {prefix}{ev.event_content}"
         lines.append(line)
         buttons.append([
             InlineKeyboardButton(f"✏️ {ev.event_content[:12]}", callback_data=f"re:edit:{ev.id}"),
@@ -139,7 +151,7 @@ def parse_dt(text: str) -> datetime | None:
 
 # ── /start & /help ────────────────────────────────────────────────────────────
 
-HELP_TEXT = """🤖 <b>AI 智慧管家</b>
+HELP_TEXT = """🤖 <b>Telegram 智慧管家</b>
 
 <b>📅 提醒功能</b>
 <code>提醒 [誰] [日期] [時間] [事件]</code>
@@ -160,7 +172,7 @@ HELP_TEXT = """🤖 <b>AI 智慧管家</b>
 <b>通用</b>：<code>取消</code> — 中斷操作"""
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await reply(update, f"👋 歡迎使用 AI 智慧管家！\n\n{HELP_TEXT}")
+    await reply(update, f"👋 歡迎使用 Telegram 智慧管家！\n\n{HELP_TEXT}")
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reply(update, HELP_TEXT)
@@ -169,7 +181,6 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── 提醒 ─────────────────────────────────────────────────────────────────────
 
 def _parse_reminder_text(text: str):
-    import re
     pat = r"^(?:提醒|重要提醒)\s+(\S+)\s+(\d{4}[-/]\d{2}[-/]\d{2}|\d{1,2}[/-]\d{1,2})\s+(\d{1,2}:\d{2})\s+(.+)$"
     m = re.match(pat, text)
     if not m:
@@ -207,7 +218,7 @@ async def handle_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: 
                          target_type=ctype, display_name=display,
                          content=content, event_datetime=dt)
     if not event_id:
-        await reply(update, "❌ 建立提醒失敗，請稍後再試。")
+        await reply(update, "❌ 建立提醒失敗。")
         return
     safe_add_job(send_reminder, dt, [event_id], f"reminder_{event_id}")
     await reply(update,
@@ -243,8 +254,7 @@ async def cb_snooze(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: in
     new_time = now_taipei() + timedelta(minutes=minutes)
     update_reminder_time(event_id, new_time)
     safe_add_job(send_reminder, new_time, [event_id], f"reminder_{event_id}")
-    await q.edit_message_text(
-        f"💤 已延後 {minutes} 分鐘\n新提醒時間：{new_time.strftime('%H:%M')}")
+    await q.edit_message_text(f"💤 已延後 {minutes} 分鐘\n新提醒時間：{new_time.strftime('%H:%M')}")
 
 async def cb_delete_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
     q = update.callback_query
@@ -268,13 +278,11 @@ async def cb_edit_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_i
         return
     user_states[update.effective_user.id] = {
         "action": "edit_reminder_content",
-        "event_id": event_id,
-        "original": ev.event_content,
+        "event_id": event_id, "original": ev.event_content,
     }
     await q.edit_message_text(
         f"✏️ 請輸入新的提醒內容：\n（目前：{ev.event_content}）\n\n"
-        "💡 以 <code>+</code> 開頭可補充而非覆蓋",
-        parse_mode=ParseMode.HTML)
+        "💡 以 <code>+</code> 開頭可補充而非覆蓋", parse_mode=ParseMode.HTML)
 
 async def cb_priority(update: Update, ctx: ContextTypes.DEFAULT_TYPE, level: int):
     q       = update.callback_query
@@ -341,14 +349,11 @@ async def _finish_recurring(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         creator_user_id=user_id,
         target_id=str(update.effective_chat.id),
         target_type=chat_type(update),
-        display_name=display,
-        content=content,
-        event_datetime=now_taipei(),
-        is_recurring=1,
-        recurrence_rule=rule_str,
+        display_name=display, content=content,
+        event_datetime=now_taipei(), is_recurring=1, recurrence_rule=rule_str,
     )
     if not event_id:
-        await reply(update, "❌ 建立失敗，請稍後再試。")
+        await reply(update, "❌ 建立失敗。")
         return
     safe_add_cron(send_reminder, [event_id], f"recurring_{event_id}", days_str, h, minute)
     day_names = [WEEKDAY_NAMES[WEEKDAY_CODES.index(d)] for d in sorted(days) if d in WEEKDAY_CODES]
@@ -476,7 +481,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     grp     = is_group(update)
 
-    # 取消
     if text == "取消":
         if user_id in user_states:
             del user_states[user_id]
@@ -496,7 +500,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await reply(update, f"⚠️ 地點「{text.strip()}」已存在。")
             return
         elif action == "recurring_set_time":
-            import re
             m = re.match(r"^(\d{1,2}):(\d{2})$", text.strip())
             if not m:
                 await reply(update, "❌ 格式錯誤，請輸入 HH:MM，如 09:00")
@@ -555,12 +558,11 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text.lower() in ("help", "說明", "幫助"):
         await cmd_help(update, ctx); return
 
-    # 群組靜默，私訊才提示
     if not grp:
         await reply(update, "🤔 我聽不懂，輸入「說明」查看指令。")
 
 
-# ── Callback 統一入口 ─────────────────────────────────────────────────────────
+# ── Callback ─────────────────────────────────────────────────────────────────
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q    = update.callback_query
@@ -580,13 +582,13 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await cb_priority(update, ctx, int(parts[1]))
         elif parts[0] == "re":
             action = parts[1]
-            if action == "page":   await handle_reminder_list(update, ctx, int(parts[2]))
-            elif action == "del":  await cb_delete_prompt(update, ctx, int(parts[2]))
-            elif action == "delok":await cb_delete_ok(update, ctx, int(parts[2]))
-            elif action == "edit": await cb_edit_prompt(update, ctx, int(parts[2]))
+            if action == "page":    await handle_reminder_list(update, ctx, int(parts[2]))
+            elif action == "del":   await cb_delete_prompt(update, ctx, int(parts[2]))
+            elif action == "delok": await cb_delete_ok(update, ctx, int(parts[2]))
+            elif action == "edit":  await cb_edit_prompt(update, ctx, int(parts[2]))
         elif parts[0] == "rec":
-            if parts[1] == "toggle":  await cb_rec_toggle(update, ctx, parts[2])
-            elif parts[1] == "settime": await cb_rec_settime(update, ctx)
+            if parts[1] == "toggle":   await cb_rec_toggle(update, ctx, parts[2])
+            elif parts[1] == "settime":await cb_rec_settime(update, ctx)
         elif parts[0] == "loc":
             if parts[1] == "send": await cb_loc_send(update, ctx, int(parts[2]))
             elif parts[1] == "del":await cb_loc_del(update, ctx, int(parts[2]))
@@ -605,93 +607,103 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── PTB Application ───────────────────────────────────────────────────────────
 
 def build_ptb_app() -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help",  cmd_help))
-    app.add_handler(MessageHandler(filters.LOCATION, handle_location_msg))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    return app
+    a = Application.builder().token(BOT_TOKEN).build()
+    a.add_handler(CommandHandler("start", cmd_start))
+    a.add_handler(CommandHandler("help",  cmd_help))
+    a.add_handler(MessageHandler(filters.LOCATION, handle_location_msg))
+    a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    a.add_handler(CallbackQueryHandler(handle_callback))
+    return a
 
 
-# ── FastAPI（生產環境）────────────────────────────────────────────────────────
+# ── Flask routes ──────────────────────────────────────────────────────────────
 
-ptb_app: Application = None
+@app.route("/", methods=["GET"])
+def root():
+    return {"service": "TG Reminder Bot", "status": "running"}, 200
 
-@asynccontextmanager
-async def lifespan(web: FastAPI):
-    global ptb_app
+@app.route("/health", methods=["GET"])
+def health():
+    return {"status": "ok", "scheduler": scheduler.running}, 200
 
-    # 啟動診斷
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    """Telegram 推送更新的端點"""
+    data   = request.get_json(force=True)
+    update = Update.de_json(data, _ptb_app.bot)
+    asyncio.run_coroutine_threadsafe(
+        _ptb_app.process_update(update), _loop
+    ).result(timeout=30)
+    return "OK", 200
+
+@app.route("/set_webhook", methods=["GET"])
+def set_webhook():
+    """手動設定 Webhook（WEBHOOK_URL 直接包含完整路徑）"""
+    if not WEBHOOK_URL or not BOT_TOKEN:
+        return {"error": "WEBHOOK_URL 或 BOT_TOKEN 未設定"}, 400
+    try:
+        _async(_ptb_app.bot.set_webhook(
+            url=WEBHOOK_URL,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        ))
+        return {"result": f"✅ Webhook 已設定：{WEBHOOK_URL}"}, 200
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+@app.route("/webhook_info", methods=["GET"])
+def webhook_info():
+    try:
+        info = _async(_ptb_app.bot.get_webhook_info())
+        return {"url": info.url, "pending": info.pending_update_count,
+                "last_error": info.last_error_message}, 200
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
+# ── 啟動 ─────────────────────────────────────────────────────────────────────
+
+def start():
+    global _loop, _ptb_app
+
     logger.info("=" * 50)
-    for key in ["TELEGRAM_BOT_TOKEN", "DATABASE_URL", "GOOGLE_API_KEY",
-                "GOOGLE_SEARCH_ENGINE_ID", "WEBHOOK_URL"]:
-        val = os.environ.get(key, "")
-        logger.info(f"  {key}: {'✅ OK' if val else '❌ MISSING'}")
+    logger.info(f"  TELEGRAM_BOT_TOKEN: {'✅' if BOT_TOKEN else '❌ MISSING'}")
+    logger.info(f"  DATABASE_URL: {'✅' if os.environ.get('DATABASE_URL') else '❌ MISSING'}")
+    logger.info(f"  WEBHOOK_URL: {WEBHOOK_URL or '❌ MISSING'}")
     logger.info("=" * 50)
 
     init_db()
     safe_start()
 
-    ptb_app = build_ptb_app()
-    await ptb_app.initialize()
-    await ptb_app.start()
+    # 啟動 asyncio event loop（背景 thread）
+    _loop = asyncio.new_event_loop()
+    t = threading.Thread(target=_run_event_loop, args=(_loop,), daemon=True)
+    t.start()
 
-    if WEBHOOK_URL and BOT_TOKEN:
-        webhook_full = f"{WEBHOOK_URL}/{BOT_TOKEN}"
-        await ptb_app.bot.set_webhook(
-            url=webhook_full,
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-        )
-        logger.info(f"✅ Webhook 已設定：{webhook_full}")
+    # 初始化 PTB
+    _ptb_app = build_ptb_app()
+    _async(_ptb_app.initialize())
+    _async(_ptb_app.start())
+
+    # 設定 Webhook（失敗只警告，不 crash）
+    if WEBHOOK_URL:
+        try:
+            _async(_ptb_app.bot.set_webhook(
+                url=WEBHOOK_URL,
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+            ))
+            logger.info(f"✅ Webhook 設定成功：{WEBHOOK_URL}")
+        except Exception as e:
+            logger.warning(f"⚠️ Webhook 設定失敗（可用 /set_webhook 手動補設）：{e}")
     else:
         logger.warning("⚠️ WEBHOOK_URL 未設定")
 
-    yield
-
-    await ptb_app.stop()
-    await ptb_app.shutdown()
-    if scheduler.running:
-        scheduler.shutdown(wait=False)
-
-web_app = FastAPI(lifespan=lifespan)
-
-@web_app.post("/{token}")
-async def telegram_webhook(token: str, request: Request):
-    if token != BOT_TOKEN:
-        return Response(status_code=403)
-    data   = await request.json()
-    update = Update.de_json(data, ptb_app.bot)
-    await ptb_app.process_update(update)
-    return Response(content="OK")
-
-@web_app.get("/health")
-def health():
-    return {"status": "ok", "scheduler": scheduler.running, "bot": ptb_app is not None}
-
-@web_app.get("/")
-def root():
-    return {"service": "TG Reminder Bot", "status": "running"}
+    logger.info("🤖 Bot 啟動完成，等待訊息...")
 
 
-# ── 本機 polling 模式 ─────────────────────────────────────────────────────────
-
-async def run_polling():
-    import asyncio
-    init_db()
-    safe_start()
-    app = build_ptb_app()
-    logger.info("🔄 Polling 模式（本機開發）...")
-    async with app:
-        await app.start()
-        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        await asyncio.Event().wait()
-
+# Gunicorn 載入時執行
+start()
 
 if __name__ == "__main__":
-    if WEBHOOK_URL:
-        uvicorn.run("bot:web_app", host="0.0.0.0", port=PORT, log_level="info")
-    else:
-        import asyncio
-        asyncio.run(run_polling())
+    app.run(host="0.0.0.0", port=PORT)
