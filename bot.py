@@ -43,7 +43,7 @@ app = Flask(__name__)
 _loop: asyncio.AbstractEventLoop = None
 _ptb_app: Application = None
 user_states: dict[int, dict] = {}
-sticker_users: set[int] = {}   # 已開啟貼圖轉換模式的 user_id
+sticker_users: set[int] = set()   # 已開啟貼圖轉換模式的 user_id
 
 
 # ── asyncio bridge ────────────────────────────────────────────────────────────
