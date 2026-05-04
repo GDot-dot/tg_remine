@@ -1,6 +1,5 @@
-# bot.py - Telegram 智慧管家（Flask + Gunicorn，對齊原 LINE 專案架構）
-#
-# 架構：Flask 處理 HTTP（Gunicorn 啟動），PTB async 跑在背景 event loop thread
+# bot.py - Telegram 智慧管家（Flask + Gunicorn）
+# 邏輯對齊原 LINE 版本
 
 import os
 import re
@@ -8,12 +7,10 @@ import threading
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from flask import Flask, request, abort
+from flask import Flask, request
 
 import pytz
-from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove,
-)
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters,
@@ -38,24 +35,22 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")  # 完整含路徑，如 https://xxx.fly.dev/bot
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")
 PORT        = int(os.environ.get("PORT", 8080))
 
 app = Flask(__name__)
-
-# ── PTB async 跑在獨立 thread ─────────────────────────────────────────────────
 _loop: asyncio.AbstractEventLoop = None
 _ptb_app: Application = None
 user_states: dict[int, dict] = {}
 
 
-def _run_event_loop(loop: asyncio.AbstractEventLoop):
+# ── asyncio bridge ────────────────────────────────────────────────────────────
+
+def _run_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
-
 def _async(coro):
-    """在 PTB event loop 裡執行 coroutine（供 Flask sync thread 呼叫）"""
     return asyncio.run_coroutine_threadsafe(coro, _loop).result(timeout=30)
 
 
@@ -68,6 +63,22 @@ def kb(*rows) -> InlineKeyboardMarkup:
 
 WEEKDAY_CODES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 WEEKDAY_NAMES = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+
+# 提早提醒選項（對齊 LINE 版）
+EARLY_OPTIONS = [
+    ("準時提醒",  0),
+    ("前 10 分鐘", 10),
+    ("前 30 分鐘", 30),
+    ("1 天前",    1440),
+    ("不提醒",   -1),
+]
+
+# 重要提醒優先等級選項（對齊 LINE 版）
+PRIORITY_OPTIONS = [
+    ("🔴 高（5分重提/3次）",  3),
+    ("🟡 中（10分重提/2次）", 2),
+    ("🟢 低（30分重提/1次）", 1),
+]
 
 
 def recurring_kb(selected: set) -> InlineKeyboardMarkup:
@@ -96,8 +107,11 @@ def reminder_list_kb(events: list, page: int = 0, page_size: int = 5):
             rt       = ev.reminder_time.astimezone(TAIPEI_TZ)
             snoozing = ev.reminder_time != ev.event_datetime
             icon     = "💤" if snoozing else "⏰"
-            prefix   = "(延) " if snoozing else ""
-            line     = f"{icon} {rt.strftime('%m/%d %H:%M')} {prefix}{ev.event_content}"
+            if ev.priority_level == 3: icon = "🔴"
+            elif ev.priority_level == 2: icon = "🟡"
+            elif ev.priority_level == 1: icon = "🟢"
+            prefix = "(延) " if snoozing else ""
+            line   = f"{icon} {rt.strftime('%m/%d %H:%M')} {prefix}{ev.event_content}"
         lines.append(line)
         buttons.append([
             InlineKeyboardButton(f"✏️ {ev.event_content[:12]}", callback_data=f"re:edit:{ev.id}"),
@@ -113,7 +127,7 @@ def reminder_list_kb(events: list, page: int = 0, page_size: int = 5):
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
-# ── 工具函式 ─────────────────────────────────────────────────────────────────
+# ── 工具 ─────────────────────────────────────────────────────────────────────
 
 def now_taipei() -> datetime:
     return datetime.now(TAIPEI_TZ)
@@ -133,20 +147,29 @@ async def reply(update: Update, text: str, keyboard=None):
     else:
         await update.message.reply_text(text, **kwargs)
 
-def parse_dt(text: str) -> datetime | None:
-    formats = ["%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M", "%m/%d %H:%M", "%m-%d %H:%M", "%H:%M"]
+
+def parse_dt_from_parts(date_str: str, time_str: str | None) -> datetime | None:
+    """
+    對齊 LINE 版：支援 今天/明天/後天 及 YYYY-MM-DD / MM/DD 格式
+    time_str 可為 None（預設 00:00）
+    """
     now = now_taipei()
-    for fmt in formats:
-        try:
-            dt = datetime.strptime(text.strip(), fmt)
-            if fmt == "%H:%M":
-                dt = dt.replace(year=now.year, month=now.month, day=now.day)
-            elif fmt in ("%m/%d %H:%M", "%m-%d %H:%M"):
-                dt = dt.replace(year=now.year)
-            return TAIPEI_TZ.localize(dt)
-        except ValueError:
-            continue
-    return None
+    day_map = {"今天": 0, "明天": 1, "後天": 2}
+
+    if date_str in day_map:
+        base = now + timedelta(days=day_map[date_str])
+        date_part = base.strftime("%Y-%m-%d")
+    else:
+        date_part = date_str.replace("/", "-")
+        if date_part.count("-") == 1:          # MM-DD → 補年
+            date_part = f"{now.year}-{date_part}"
+
+    time_part = time_str if time_str else "00:00"
+    try:
+        naive = datetime.strptime(f"{date_part} {time_part}", "%Y-%m-%d %H:%M")
+        return TAIPEI_TZ.localize(naive)
+    except ValueError:
+        return None
 
 
 # ── /start & /help ────────────────────────────────────────────────────────────
@@ -155,6 +178,7 @@ HELP_TEXT = """🤖 <b>Telegram 智慧管家</b>
 
 <b>📅 提醒功能</b>
 <code>提醒 [誰] [日期] [時間] [事件]</code>
+<i>日期可用：今天 / 明天 / 後天 / MM/DD / YYYY-MM-DD</i>
 <code>重要提醒 [誰] [日期] [時間] [事件]</code>
 <code>週期提醒</code> — 設定每週重複
 <code>提醒清單</code> — 管理所有提醒
@@ -178,57 +202,264 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reply(update, HELP_TEXT)
 
 
-# ── 提醒 ─────────────────────────────────────────────────────────────────────
+# ── 提醒解析（對齊 LINE regex 邏輯）─────────────────────────────────────────
 
-def _parse_reminder_text(text: str):
-    pat = r"^(?:提醒|重要提醒)\s+(\S+)\s+(\d{4}[-/]\d{2}[-/]\d{2}|\d{1,2}[/-]\d{1,2})\s+(\d{1,2}:\d{2})\s+(.+)$"
-    m = re.match(pat, text)
+_REMINDER_RE = re.compile(
+    r"^(?:提醒|重要提醒)(.*?)\s+"          # 前綴 + 誰（可空）
+    r"(今天|明天|後天|\d{1,4}[/\-]\d{1,2}(?:[/\-]\d{2,4})?)"  # 日期
+    r"\s*(\d{1,2}:\d{2})?"                # 時間（可選）
+    r"\s*(.+)$"                           # 事件內容
+)
+
+def parse_reminder_text(text: str):
+    """回傳 (who, event_dt, content) 或 (None, None, None)"""
+    m = _REMINDER_RE.match(text)
     if not m:
         return None, None, None
-    who, date_s, time_s, content = m.groups()
-    dt = parse_dt(f"{date_s.replace('/','-')} {time_s}")
-    return who, dt, content
+    who_raw, date_s, time_s, content = m.groups()
+    who = who_raw.strip() or "我"
+    dt  = parse_dt_from_parts(date_s, time_s)
+    return who, dt, content.strip()
+
+
+# ── 一般提醒：建立後問提早時間（對齊 LINE 版）────────────────────────────────
 
 async def handle_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
-    user_id     = update.effective_user.id
-    is_priority = text.startswith("重要提醒")
-    who, dt, content = _parse_reminder_text(text)
+    user_id = update.effective_user.id
+    who, dt, content = parse_reminder_text(text)
+
     if not (who and dt and content):
         await reply(update,
             "格式：<code>提醒 [誰] [日期] [時間] [事件]</code>\n"
-            "例：<code>提醒 我 2025-08-01 09:00 開會</code>")
+            "日期：今天 / 明天 / 後天 / MM/DD / YYYY-MM-DD\n"
+            "例：<code>提醒 我 明天 09:00 開會</code>")
         return
     if dt <= now_taipei():
-        await reply(update, "❌ 設定的時間已經過了！")
+        await reply(update, "⚠️ 提醒時間不能設定在過去喔！")
         return
+
     display = update.effective_user.first_name or who
     chat_id = str(update.effective_chat.id)
     ctype   = chat_type(update)
-    if is_priority:
-        user_states[user_id] = {
-            "action": "set_priority",
-            "who": who, "dt": dt, "content": content,
-            "chat_id": chat_id, "ctype": ctype, "display": display,
-        }
-        await reply(update, "❗ 請選擇重要程度：",
-            kb([("🟢 低（30分重提）", "prio:1"), ("🟡 中（10分重提）", "prio:2")],
-               [("🔴 高（5分重提）", "prio:3")]))
-        return
+
     event_id = add_event(creator_user_id=user_id, target_id=chat_id,
                          target_type=ctype, display_name=display,
                          content=content, event_datetime=dt)
     if not event_id:
         await reply(update, "❌ 建立提醒失敗。")
         return
-    safe_add_job(send_reminder, dt, [event_id], f"reminder_{event_id}")
+
+    # 問提早時間（對齊 LINE 版 QuickReply）
+    rows = []
+    row  = []
+    for label, minutes in EARLY_OPTIONS:
+        cb = f"sr:{event_id}:{minutes}"
+        row.append(InlineKeyboardButton(label, callback_data=cb))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+
+    markup = InlineKeyboardMarkup(rows)
     await reply(update,
-        f"✅ 提醒已設定！\n\n👤 {who}\n📅 {dt.strftime('%Y/%m/%d %H:%M')}\n📝 {content}")
+        f"✅ 已記錄！\n\n👤 {who}\n📅 {dt.strftime('%Y/%m/%d %H:%M')}\n📝 {content}\n\n"
+        f"希望什麼時候提醒您呢？", markup)
+
+
+async def cb_set_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                           event_id: int, minutes: int):
+    """
+    對齊 LINE 的 set_reminder postback：
+    -1 = 不提醒（刪除事件）
+     0 = 準時（reminder_time = event_datetime）
+    >0 = 提前 N 分鐘
+    """
+    q = update.callback_query
+    await q.answer()
+
+    if minutes == -1:
+        # 不提醒 → 刪除事件（對齊 LINE 的 type=none）
+        delete_event_by_id(event_id, str(update.effective_user.id))
+        await q.edit_message_text("🗑️ OK，已取消記錄。")
+        return
+
+    ev = get_event(event_id)
+    if not ev:
+        await q.edit_message_text("❌ 找不到事件。")
+        return
+
+    event_dt    = ev.event_datetime.astimezone(TAIPEI_TZ)
+    reminder_dt = event_dt - timedelta(minutes=minutes)
+
+    if reminder_dt <= now_taipei():
+        await q.edit_message_text("⚠️ 提醒時間已過，無法設定。")
+        return
+
+    update_reminder_time(event_id, reminder_dt)
+    safe_add_job(send_reminder, reminder_dt, [event_id], f"reminder_{event_id}")
+
+    early_txt = f"（{[l for l,m in EARLY_OPTIONS if m==minutes][0]}）" if minutes > 0 else "（準時）"
+    await q.edit_message_text(
+        f"✅ 設定完成！\n"
+        f"將於 {reminder_dt.strftime('%Y/%m/%d %H:%M')} {early_txt} 提醒您。")
+
+
+# ── 重要提醒：兩步驟流程（對齊 LINE 版）─────────────────────────────────────
+
+async def handle_priority_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    """第一步：解析指令 → 問提早時間"""
+    user_id  = update.effective_user.id
+    who, dt, content = parse_reminder_text(text)
+
+    if not (who and dt and content):
+        await reply(update,
+            "格式：<code>重要提醒 [誰] [日期] [時間] [事件]</code>\n"
+            "例：<code>重要提醒 我 明天 10:00 搶票</code>")
+        return
+    if dt <= now_taipei():
+        await reply(update, "⚠️ 提醒時間不能設定在過去！")
+        return
+
+    display = update.effective_user.first_name or who
+    # 存入 state，等使用者選提早時間
+    user_states[user_id] = {
+        "action":   "priority_pick_early",
+        "who":      who,
+        "display":  display,
+        "dt":       dt,
+        "content":  content,
+        "chat_id":  str(update.effective_chat.id),
+        "ctype":    chat_type(update),
+    }
+
+    rows = []
+    row  = []
+    for label, minutes in EARLY_OPTIONS:
+        if minutes == -1: continue  # 重要提醒不提供「不提醒」
+        cb = f"pe:{minutes}"
+        row.append(InlineKeyboardButton(label, callback_data=cb))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("❌ 取消", callback_data="cancel")])
+
+    await reply(update,
+        f"❗ 重要提醒設定\n\n"
+        f"👤 {who}\n📅 {dt.strftime('%Y/%m/%d %H:%M')}\n📝 {content}\n\n"
+        "您希望在事件發生前多久收到通知？",
+        InlineKeyboardMarkup(rows))
+
+
+async def cb_priority_early(update: Update, ctx: ContextTypes.DEFAULT_TYPE, minutes: int):
+    """第二步：選提早時間 → 問優先等級"""
+    q       = update.callback_query
+    await q.answer()
+    user_id = update.effective_user.id
+    state   = user_states.get(user_id, {})
+    if state.get("action") != "priority_pick_early":
+        return
+
+    state["minutes_early"] = minutes
+    state["action"]        = "priority_pick_level"
+
+    rows = [[InlineKeyboardButton(label, callback_data=f"pl:{level}")]
+            for label, level in PRIORITY_OPTIONS]
+    rows.append([InlineKeyboardButton("❌ 取消", callback_data="cancel")])
+
+    early_txt = next((l for l,m in EARLY_OPTIONS if m==minutes), "準時")
+    await q.edit_message_text(
+        f"提前 {early_txt} 提醒。\n\n請選擇重複提醒的頻率：",
+        reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def cb_priority_level(update: Update, ctx: ContextTypes.DEFAULT_TYPE, level: int):
+    """第三步：選優先等級 → 建立事件"""
+    q       = update.callback_query
+    await q.answer()
+    user_id = update.effective_user.id
+    state   = user_states.pop(user_id, {})
+    if state.get("action") != "priority_pick_level":
+        return
+
+    rule           = PRIORITY_RULES[level]
+    dt: datetime   = state["dt"]
+    minutes_early  = state["minutes_early"]
+    reminder_dt    = dt - timedelta(minutes=minutes_early)
+
+    if reminder_dt <= now_taipei():
+        await q.edit_message_text("⚠️ 計算出的提醒時間已過，無法設定。")
+        return
+
+    event_id = add_event(
+        creator_user_id=user_id,
+        target_id=state["chat_id"],
+        target_type=state["ctype"],
+        display_name=state["display"],
+        content=state["content"],
+        event_datetime=dt,
+        priority_level=level,
+        remaining_repeats=rule["repeats"],
+    )
+    if not event_id:
+        await q.edit_message_text("❌ 建立失敗。")
+        return
+
+    safe_add_job(send_reminder, reminder_dt, [event_id], f"reminder_{event_id}")
+    early_txt = next((l for l,m in EARLY_OPTIONS if m==minutes_early), "準時")
+    await q.edit_message_text(
+        f"{rule['icon']} 重要提醒已設定！\n\n"
+        f"📅 {dt.strftime('%Y/%m/%d %H:%M')}（{early_txt}開始提醒）\n"
+        f"📝 {state['content']}\n"
+        f"⏱️ 未確認將每 {rule['interval']} 分鐘重提，共 {rule['repeats']} 次")
+
+
+# ── 確認 / 延後（對齊 LINE：非週期確認後刪除）────────────────────────────────
+
+async def cb_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
+    q = update.callback_query
+    await q.answer("✅ 已確認！")
+    ev = get_event(event_id)
+    if ev:
+        remove_job(event_id)
+        if ev.is_recurring:
+            # 週期：不刪，只回覆（對齊 LINE 版）
+            await q.edit_message_text("✅ 提醒已確認收到！（下個週期會繼續提醒）")
+        else:
+            # 非週期（含重要提醒）：確認後刪除（對齊 LINE 版）
+            delete_event_by_id(event_id, str(update.effective_user.id))
+            await q.edit_message_text("✅ 任務已完成並移除！")
+    else:
+        await q.edit_message_text("✅ 提醒已確認（任務已結束）。")
+
+
+async def cb_snooze(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int, minutes: int):
+    q = update.callback_query
+    await q.answer(f"💤 延後 {minutes} 分鐘")
+    ev = get_event(event_id)
+    if not ev:
+        await q.edit_message_text("❌ 找不到事件。")
+        return
+    new_time = now_taipei() + timedelta(minutes=minutes)
+    update_reminder_time(event_id, new_time)
+    # 內容加上 (延) 標記（對齊 LINE 版）
+    content = ev.event_content
+    if not content.startswith("(延)"):
+        update_event_content(event_id, f"(延) {content}")
+    safe_add_job(send_reminder, new_time, [event_id], f"reminder_{event_id}")
+    await q.edit_message_text(f"💤 已延後 {minutes} 分鐘\n新提醒時間：{new_time.strftime('%H:%M')}")
+
+
+# ── 提醒清單 ─────────────────────────────────────────────────────────────────
 
 async def handle_reminder_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: int = 0):
     user_id = update.effective_user.id
-    events  = get_user_events(str(user_id))
+    # 對齊 LINE 版：過濾掉已發送且非週期的
+    all_events = get_user_events(str(user_id))
+    events = [ev for ev in all_events
+              if ev.is_recurring or (not ev.reminder_sent and ev.reminder_time is not None)]
     if not events:
-        await reply(update, "📋 目前沒有任何提醒。")
+        await reply(update, "📋 目前沒有進行中的提醒。")
         return
     text, markup = reminder_list_kb(events, page)
     if update.callback_query:
@@ -237,24 +468,6 @@ async def handle_reminder_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE, p
     else:
         await reply(update, text, markup)
 
-async def cb_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
-    q = update.callback_query
-    await q.answer("✅ 已確認！")
-    ev = get_event(event_id)
-    if ev:
-        mark_reminder_sent(event_id)
-        remove_job(event_id)
-        if ev.priority_level > 0:
-            delete_event_by_id(event_id, str(update.effective_user.id))
-    await q.edit_message_text("✅ 提醒已確認，任務完成！")
-
-async def cb_snooze(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int, minutes: int):
-    q = update.callback_query
-    await q.answer(f"💤 延後 {minutes} 分鐘")
-    new_time = now_taipei() + timedelta(minutes=minutes)
-    update_reminder_time(event_id, new_time)
-    safe_add_job(send_reminder, new_time, [event_id], f"reminder_{event_id}")
-    await q.edit_message_text(f"💤 已延後 {minutes} 分鐘\n新提醒時間：{new_time.strftime('%H:%M')}")
 
 async def cb_delete_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
     q = update.callback_query
@@ -277,43 +490,23 @@ async def cb_edit_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_i
         await q.edit_message_text("❌ 找不到該提醒。")
         return
     user_states[update.effective_user.id] = {
-        "action": "edit_reminder_content",
-        "event_id": event_id, "original": ev.event_content,
+        "action":   "edit_reminder_content",
+        "event_id": event_id,
+        "original": ev.event_content,
     }
     await q.edit_message_text(
-        f"✏️ 請輸入新的提醒內容：\n（目前：{ev.event_content}）\n\n"
-        "💡 以 <code>+</code> 開頭可補充而非覆蓋", parse_mode=ParseMode.HTML)
-
-async def cb_priority(update: Update, ctx: ContextTypes.DEFAULT_TYPE, level: int):
-    q       = update.callback_query
-    await q.answer()
-    user_id = update.effective_user.id
-    state   = user_states.get(user_id, {})
-    if state.get("action") != "set_priority":
-        return
-    rule    = PRIORITY_RULES[level]
-    dt, content, display = state["dt"], state["content"], state["display"]
-    chat_id, ctype = state["chat_id"], state["ctype"]
-    del user_states[user_id]
-    event_id = add_event(creator_user_id=user_id, target_id=chat_id,
-                         target_type=ctype, display_name=display,
-                         content=content, event_datetime=dt,
-                         priority_level=level, remaining_repeats=rule["repeats"])
-    if not event_id:
-        await q.edit_message_text("❌ 建立失敗。")
-        return
-    safe_add_job(send_reminder, dt, [event_id], f"reminder_{event_id}")
-    await q.edit_message_text(
-        f"{rule['icon']} 重要提醒已設定！\n\n"
-        f"📅 {dt.strftime('%Y/%m/%d %H:%M')}\n📝 {content}\n"
-        f"⏱️ 未確認將每 {rule['interval']} 分鐘重提")
+        f"✏️ 請輸入新的提醒內容：\n目前：{ev.event_content}\n\n"
+        "💡 以 <code>+</code> 開頭可補充而非覆蓋",
+        parse_mode=ParseMode.HTML)
 
 
-# ── 週期提醒 ─────────────────────────────────────────────────────────────────
+# ── 週期提醒（邏輯同原版，UI 改 InlineKeyboard）──────────────────────────────
 
 async def handle_recurring(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_states[update.effective_user.id] = {"action": "recurring_select_days", "days": set()}
-    await reply(update, "🔁 週期提醒設定\n請選擇要提醒的星期（可多選）：", recurring_kb(set()))
+    await reply(update,
+        "🔁 週期提醒設定\n請選擇要提醒的星期（可多選）：",
+        recurring_kb(set()))
 
 async def cb_rec_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE, day: str):
     q = update.callback_query
@@ -350,7 +543,8 @@ async def _finish_recurring(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         target_id=str(update.effective_chat.id),
         target_type=chat_type(update),
         display_name=display, content=content,
-        event_datetime=now_taipei(), is_recurring=1, recurrence_rule=rule_str,
+        event_datetime=now_taipei(),
+        is_recurring=1, recurrence_rule=rule_str,
     )
     if not event_id:
         await reply(update, "❌ 建立失敗。")
@@ -410,19 +604,18 @@ async def cb_loc_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE, loc_id: int
     loc = db.query(LocModel).filter(LocModel.id == loc_id).first()
     if loc:
         name = loc.name
-        db.delete(loc)
-        db.commit()
-        db.close()
+        db.delete(loc); db.commit(); db.close()
         await q.edit_message_text(f"🗑️ 地點「{name}」已刪除。")
     else:
         db.close()
         await q.edit_message_text("❌ 找不到該地點。")
 
 
-# ── 記憶庫 ───────────────────────────────────────────────────────────────────
+# ── 記憶庫（對齊 LINE：多筆結果用按鈕選擇）──────────────────────────────────
 
 async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     user_id = update.effective_user.id
+
     if text.startswith("記住"):
         parts = text[2:].strip().split(" ", 1)
         if len(parts) < 2:
@@ -433,23 +626,32 @@ async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: st
             await reply(update, f"🧠 已記住：<b>{kw}</b>\n{content}")
         else:
             await reply(update, "❌ 儲存失敗。")
+
     elif text.startswith("查詢"):
         kw      = text[2:].strip()
+        if not kw:
+            await reply(update, "格式：<code>查詢 [關鍵字]</code>")
+            return
         results = query_memory(user_id, kw)
         if not results:
             await reply(update, f"🔍 找不到「{kw}」的記憶。")
         elif len(results) == 1:
             await reply(update, f"🧠 <b>{results[0].keyword}</b>\n{results[0].content}")
         else:
+            # 多筆 → 按鈕選擇（對齊 LINE QuickReply 邏輯）
             btns = [[InlineKeyboardButton(m.keyword, callback_data=f"mem:view:{m.id}")]
                     for m in results]
-            await reply(update, "🔍 找到多筆，請選擇：", InlineKeyboardMarkup(btns))
+            await reply(update,
+                f"🔍 找到 {len(results)} 筆關於「{kw}」的記憶，請選擇：",
+                InlineKeyboardMarkup(btns))
+
     elif text.startswith("忘記"):
         kw = text[2:].strip()
         if forget_memory(user_id, kw):
             await reply(update, f"🗑️ 已忘記「{kw}」。")
         else:
             await reply(update, f"❌ 找不到「{kw}」。")
+
     elif text == "記憶清單":
         mems = list_memories(user_id)
         if not mems:
@@ -481,6 +683,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     grp     = is_group(update)
 
+    # 取消
     if text == "取消":
         if user_id in user_states:
             del user_states[user_id]
@@ -492,6 +695,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # 狀態機
     if user_id in user_states:
         action = user_states[user_id].get("action")
+
         if action == "await_location_name":
             state = user_states.pop(user_id)
             if add_location(user_id, text.strip(), state["lat"], state["lng"]):
@@ -499,6 +703,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else:
                 await reply(update, f"⚠️ 地點「{text.strip()}」已存在。")
             return
+
         elif action == "recurring_set_time":
             m = re.match(r"^(\d{1,2}):(\d{2})$", text.strip())
             if not m:
@@ -509,10 +714,12 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             user_states[user_id]["action"] = "recurring_input_content"
             await reply(update, "📝 請輸入提醒事項內容：")
             return
+
         elif action == "recurring_input_content":
             time_str = user_states[user_id].get("time", "09:00")
             await _finish_recurring(update, ctx, user_id, time_str, text.strip())
             return
+
         elif action == "edit_reminder_content":
             event_id = user_states[user_id]["event_id"]
             original = user_states[user_id]["original"]
@@ -530,7 +737,9 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # 固定指令路由
     if text == "提醒清單":
         await handle_reminder_list(update, ctx); return
-    if text.startswith("重要提醒") or text.startswith("提醒"):
+    if text.startswith("重要提醒"):
+        await handle_priority_reminder(update, ctx, text); return
+    if text.startswith("提醒"):
         await handle_reminder(update, ctx, text); return
     if text == "週期提醒":
         await handle_recurring(update, ctx); return
@@ -558,11 +767,15 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text.lower() in ("help", "說明", "幫助"):
         await cmd_help(update, ctx); return
 
+    # 群組靜默，私訊才提示
     if not grp:
-        await reply(update, "🤔 我聽不懂，輸入「說明」查看指令。")
+        await reply(update,
+            "🤔 我聽不太懂，您可以試著說：\n"
+            "「提醒 我 明天 09:00 開會」\n"
+            "或輸入「說明」查看指令。")
 
 
-# ── Callback ─────────────────────────────────────────────────────────────────
+# ── Callback 統一入口 ─────────────────────────────────────────────────────────
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q    = update.callback_query
@@ -573,29 +786,52 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("已取消")
             await q.edit_message_text("❌ 操作已取消。")
             return
+
         parts = data.split(":")
+
+        # ── 提醒確認 / 延後
         if parts[0] == "cr":
             await cb_confirm(update, ctx, int(parts[1]))
         elif parts[0] == "sn":
             await cb_snooze(update, ctx, int(parts[1]), int(parts[2]))
-        elif parts[0] == "prio":
-            await cb_priority(update, ctx, int(parts[1]))
+
+        # ── 一般提醒：選提早時間  sr:event_id:minutes
+        elif parts[0] == "sr":
+            await cb_set_reminder(update, ctx, int(parts[1]), int(parts[2]))
+
+        # ── 重要提醒：選提早時間  pe:minutes
+        elif parts[0] == "pe":
+            await cb_priority_early(update, ctx, int(parts[1]))
+
+        # ── 重要提醒：選等級  pl:level
+        elif parts[0] == "pl":
+            await cb_priority_level(update, ctx, int(parts[1]))
+
+        # ── 提醒清單操作
         elif parts[0] == "re":
             action = parts[1]
             if action == "page":    await handle_reminder_list(update, ctx, int(parts[2]))
             elif action == "del":   await cb_delete_prompt(update, ctx, int(parts[2]))
             elif action == "delok": await cb_delete_ok(update, ctx, int(parts[2]))
             elif action == "edit":  await cb_edit_prompt(update, ctx, int(parts[2]))
+
+        # ── 週期提醒
         elif parts[0] == "rec":
-            if parts[1] == "toggle":   await cb_rec_toggle(update, ctx, parts[2])
-            elif parts[1] == "settime":await cb_rec_settime(update, ctx)
+            if parts[1] == "toggle":    await cb_rec_toggle(update, ctx, parts[2])
+            elif parts[1] == "settime": await cb_rec_settime(update, ctx)
+
+        # ── 地點
         elif parts[0] == "loc":
             if parts[1] == "send": await cb_loc_send(update, ctx, int(parts[2]))
             elif parts[1] == "del":await cb_loc_del(update, ctx, int(parts[2]))
+
+        # ── 記憶庫
         elif parts[0] == "mem":
             if parts[1] == "view": await cb_mem_view(update, ctx, int(parts[2]))
+
         else:
             await q.answer("❓ 未知操作", show_alert=True)
+
     except Exception as e:
         logger.error(f"Callback error ({data}): {e}", exc_info=True)
         try:
@@ -628,7 +864,6 @@ def health():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Telegram 推送更新的端點"""
     data   = request.get_json(force=True)
     update = Update.de_json(data, _ptb_app.bot)
     asyncio.run_coroutine_threadsafe(
@@ -637,8 +872,7 @@ def webhook():
     return "OK", 200
 
 @app.route("/set_webhook", methods=["GET"])
-def set_webhook():
-    """手動設定 Webhook（WEBHOOK_URL 直接包含完整路徑）"""
+def set_webhook_route():
     if not WEBHOOK_URL or not BOT_TOKEN:
         return {"error": "WEBHOOK_URL 或 BOT_TOKEN 未設定"}, 400
     try:
@@ -675,17 +909,13 @@ def start():
     init_db()
     safe_start()
 
-    # 啟動 asyncio event loop（背景 thread）
     _loop = asyncio.new_event_loop()
-    t = threading.Thread(target=_run_event_loop, args=(_loop,), daemon=True)
-    t.start()
+    threading.Thread(target=_run_loop, args=(_loop,), daemon=True).start()
 
-    # 初始化 PTB
     _ptb_app = build_ptb_app()
     _async(_ptb_app.initialize())
     _async(_ptb_app.start())
 
-    # 設定 Webhook（失敗只警告，不 crash）
     if WEBHOOK_URL:
         try:
             _async(_ptb_app.bot.set_webhook(
@@ -699,10 +929,9 @@ def start():
     else:
         logger.warning("⚠️ WEBHOOK_URL 未設定")
 
-    logger.info("🤖 Bot 啟動完成，等待訊息...")
+    logger.info("🤖 Bot 啟動完成")
 
 
-# Gunicorn 載入時執行
 start()
 
 if __name__ == "__main__":
