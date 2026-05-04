@@ -209,7 +209,7 @@ _REPLY_KB = ReplyKeyboardMarkup(
         ["❓ 說明"],
     ],
     resize_keyboard=True,
-    persistent=True,
+    is_persistent=True,
 )
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
