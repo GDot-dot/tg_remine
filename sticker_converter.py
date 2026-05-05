@@ -14,10 +14,10 @@ import logging
 from bs4 import BeautifulSoup
 from PIL import Image
 from telegram import InputSticker
+from telegram.error import RetryAfter, TimedOut, NetworkError
 
 logger = logging.getLogger(__name__)
 
-# 完整瀏覽器 headers，避免 LINE 偵測 bot 後回傳 SPA 空殼
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -28,7 +28,6 @@ _HEADERS = {
     "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
 }
 
 _API_HEADERS = {
@@ -36,10 +35,9 @@ _API_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Referer": "https://store.line.me/",
     "Origin": "https://store.line.me",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
 }
+
+_MAX_WEBM_BYTES = 256_000  # Telegram 動態貼圖上限
 
 
 # ── 圖片處理 ──────────────────────────────────────────────────────────────────
@@ -67,27 +65,43 @@ def resize_for_telegram(image_bytes: bytes) -> "io.BytesIO | None":
         return None
 
 def convert_to_webm(image_bytes: bytes) -> "io.BytesIO | None":
+    """
+    APNG → WEBM。
+    強制碼率控制在 300k，轉出後若仍超過 256KB 回傳 None，
+    由呼叫端自動 fallback 靜態貼圖。
+    """
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         f.write(image_bytes)
         src = f.name
     dst = src + ".webm"
     try:
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", src,
-             "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
-             "-vf", "scale='if(gt(iw,ih),512,-2)':'if(gt(iw,ih),-2,512)'",
-             "-an", "-t", "3", dst],
+            [
+                "ffmpeg", "-y", "-i", src,
+                "-c:v", "libvpx-vp9",
+                "-pix_fmt", "yuva420p",
+                "-vf", "scale='if(gt(iw,ih),512,-2)':'if(gt(iw,ih),-2,512)'",
+                "-r", "20",
+                "-b:v", "300k", "-maxrate", "300k", "-bufsize", "600k",
+                "-cpu-used", "4", "-row-mt", "1",
+                "-an", "-t", "2.9",
+                dst,
+            ],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
             logger.error(f"ffmpeg 失敗: {result.stderr[-300:]}")
             return None
         with open(dst, "rb") as f:
-            out = io.BytesIO(f.read())
+            raw = f.read()
+        if len(raw) > _MAX_WEBM_BYTES:
+            logger.warning(f"webm 超過 256KB ({len(raw)} bytes)，將 fallback 靜態")
+            return None
+        out = io.BytesIO(raw)
         out.name = "sticker.webm"
         return out
     except Exception as e:
-        logger.error(f"convert_to_webm 失敗: {e}")
+        logger.error(f"convert_to_webm 例外: {e}")
         return None
     finally:
         for p in (src, dst):
@@ -97,15 +111,15 @@ def convert_to_webm(image_bytes: bytes) -> "io.BytesIO | None":
 # ── 下載工具 ──────────────────────────────────────────────────────────────────
 
 def _download(url: str, index: int) -> "bytes | None":
-    for try_url in dict.fromkeys([url, url.replace("@2x", "")]):  # 去重但保順序
+    for try_url in dict.fromkeys([url, url.replace("@2x", "")]):
         try:
             res = requests.get(try_url, headers=_HEADERS, timeout=20)
             if res.status_code == 200 and res.content:
-                logger.debug(f"[{index}] 下載成功 ({len(res.content)} bytes): {try_url}")
+                logger.debug(f"[{index}] 下載成功 ({len(res.content)} bytes)")
                 return res.content
             logger.warning(f"[{index}] HTTP {res.status_code}: {try_url}")
         except Exception as e:
-            logger.warning(f"[{index}] 下載例外: {e} ({try_url})")
+            logger.warning(f"[{index}] 下載例外: {e}")
     logger.error(f"[{index}] 下載失敗，放棄此張")
     return None
 
@@ -116,17 +130,53 @@ def _head_ok(url: str) -> bool:
         return False
 
 
+# ── Telegram API 發送（含 retry）─────────────────────────────────────────────
+
+async def _tg_upload(bot, action: str, status_msg, **kwargs) -> bool:
+    """
+    action: 'create' | 'add'
+    自動處理 RetryAfter / TimedOut / NetworkError，最多 retry 3 次。
+    """
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            if action == "create":
+                await bot.create_new_sticker_set(
+                    read_timeout=60, write_timeout=60, **kwargs
+                )
+            else:
+                await bot.add_sticker_to_set(
+                    read_timeout=60, write_timeout=60, **kwargs
+                )
+            return True
+
+        except RetryAfter as e:
+            wait = e.retry_after + 1
+            logger.warning(f"RetryAfter {wait}s，暫停...")
+            await status_msg.edit_text(f"⚠️ 伺服器限速，暫停 {wait} 秒後自動繼續...")
+            await asyncio.sleep(wait)
+
+        except (TimedOut, NetworkError) as e:
+            if attempt == max_retries - 1:
+                logger.error(f"Telegram API 失敗 (已重試 {max_retries} 次): {e}")
+                return False
+            logger.warning(f"Telegram API 暫時失敗，3 秒後 retry ({attempt+1}/{max_retries}): {e}")
+            await asyncio.sleep(3)
+
+        except Exception as e:
+            logger.error(f"Telegram API 非預期錯誤: {e}")
+            return False
+
+    return False
+
+
 # ── stickershop 解析 ───────────────────────────────────────────────────────────
 
 def _fetch_stickershop(url: str) -> "list[dict] | None":
-    """
-    優先用 LINE CDN JSON API（最快）；
-    fallback 用 HTML data-preview（需瀏覽器 headers 繞過 bot 偵測）。
-    """
     m = re.search(r"/product/(\d+)", url)
     product_id = m.group(1) if m else None
 
-    # 方法一：CDN JSON（舊格式，仍有部分包存在）
+    # 方法一：CDN JSON
     if product_id:
         for cdn_url in [
             f"https://stickershop.line-scdn.net/stickershop/v1/product/{product_id}/iPhone/stickers.json",
@@ -137,10 +187,10 @@ def _fetch_stickershop(url: str) -> "list[dict] | None":
                 logger.info(f"CDN JSON {cdn_url} -> {res.status_code}")
                 if res.status_code == 200:
                     data = res.json()
-                    stickers = []
                     items = data if isinstance(data, list) else data.get("stickers", [])
+                    stickers = []
                     for s in items:
-                        ani = s.get("animationUrl") or s.get("popupUrl")
+                        ani  = s.get("animationUrl") or s.get("popupUrl")
                         stat = s.get("staticUrl") or s.get("staticImage")
                         img_url = ani or stat
                         if img_url:
@@ -152,14 +202,13 @@ def _fetch_stickershop(url: str) -> "list[dict] | None":
             except Exception as e:
                 logger.warning(f"CDN JSON {cdn_url} 例外: {e}")
 
-    # 方法二：HTML data-preview（需完整瀏覽器 headers）
+    # 方法二：HTML data-preview（完整瀏覽器 headers 繞過 bot 偵測）
     try:
         res = requests.get(url, headers=_HEADERS, timeout=20)
-        logger.info(f"stickershop HTML {res.status_code}, url={url}")
+        logger.info(f"stickershop HTML {res.status_code}")
         soup = BeautifulSoup(res.text, "html.parser")
         items = soup.find_all(attrs={"data-preview": True})
         logger.info(f"data-preview count={len(items)}")
-
         if items:
             stickers = []
             for item in items:
@@ -179,9 +228,7 @@ def _fetch_stickershop(url: str) -> "list[dict] | None":
                 stickers.append({"url": img_url, "is_animated": bool(ani or popup or fallb)})
             if stickers:
                 return stickers
-
-        # 最後 fallback：印出 HTML 前 500 字供除錯
-        logger.warning(f"HTML 無 data-preview，body preview: {res.text[:500]}")
+        logger.warning(f"HTML 無 data-preview，body: {res.text[:500]}")
         return None
     except Exception as e:
         logger.error(f"_fetch_stickershop: {e}")
@@ -198,13 +245,12 @@ def _fetch_emojishop(url: str) -> "list[dict] | None":
     product_id = m.group(1)
     logger.info(f"emojishop product_id={product_id}")
 
-    # 方法一：LINE API（多端點嘗試）
-    api_candidates = [
+    # 方法一：LINE API
+    for api_url in [
         f"https://store.line.me/api/v1/emojishop/products/{product_id}",
         f"https://store.line.me/api/v1/emojishop/products/{product_id}/stickers",
         f"https://store.line.me/api/v1/stickershop/products/{product_id}/info",
-    ]
-    for api_url in api_candidates:
+    ]:
         try:
             res = requests.get(api_url, headers=_API_HEADERS, timeout=15)
             logger.info(f"API {api_url} -> {res.status_code}, body: {res.text[:300]}")
@@ -227,44 +273,34 @@ def _fetch_emojishop(url: str) -> "list[dict] | None":
         except Exception as e:
             logger.warning(f"API {api_url} 例外: {e}")
 
-    # 方法二：CDN 流水號 + 偵測動態版本
-    # 靜態：{base}/{n:03d}.png
-    # 動態：{base}/{n:03d}_animation.png 或 {base}/{n:03d}@2x.png
+    # 方法二：CDN 流水號 + 偵測動態 variant
     base = f"https://stickershop.line-scdn.net/sticonshop/v1/sticon/{product_id}/iPhone"
-    logger.info(f"emojishop CDN base={base}")
-
-    # 確認第一張是否存在
-    first_url = f"{base}/001.png"
-    if not _head_ok(first_url):
-        first_url = f"{base}/1.png"
-        if not _head_ok(first_url):
-            logger.error("emojishop CDN 第一張不存在，所有方法失敗")
-            return None
-
-    fmt = "001" if "001" in first_url else "1"  # 判斷命名格式
-    logger.info(f"CDN fallback 有效，格式={fmt}")
-
-    stickers = []
-    for n in range(1, 61):
-        name    = f"{n:03d}" if fmt == "001" else str(n)
-        static  = f"{base}/{name}.png"
-        ani_url = f"{base}/{name}_animation.png"  # 動態 variant
-
-        r = requests.head(static, headers=_HEADERS, timeout=5)
-        if r.status_code != 200:
-            break  # 遇到 404 表示結束
-
-        is_ani = _head_ok(ani_url)
-        stickers.append({
-            "url": ani_url if is_ani else static,
-            "static_url": static,
-            "is_animated": is_ani,
-        })
-
-    if stickers:
-        logger.info(f"CDN fallback 找到 {len(stickers)} 張（"
-                    f"動態 {sum(1 for s in stickers if s['is_animated'])} 張）")
-        return stickers
+    logger.info(f"emojishop CDN fallback base={base}")
+    try:
+        fmt = None
+        for first in [f"{base}/001.png", f"{base}/1.png"]:
+            if _head_ok(first):
+                fmt = "001" if "001" in first else "1"
+                logger.info(f"CDN 有效，格式={fmt}")
+                break
+        if fmt:
+            stickers = []
+            for n in range(1, 61):
+                name   = f"{n:03d}" if fmt == "001" else str(n)
+                static = f"{base}/{name}.png"
+                ani    = f"{base}/{name}_animation.png"
+                if not _head_ok(static):
+                    break
+                is_ani = _head_ok(ani)
+                stickers.append({"url": ani if is_ani else static,
+                                  "static_url": static,
+                                  "is_animated": is_ani})
+            if stickers:
+                logger.info(f"CDN 找到 {len(stickers)} 張 "
+                            f"(動態 {sum(1 for s in stickers if s['is_animated'])} 張)")
+                return stickers
+    except Exception as e:
+        logger.error(f"CDN fallback 例外: {e}")
 
     logger.error("emojishop: 所有方法均失敗")
     return None
@@ -303,29 +339,21 @@ async def convert_and_upload(bot, user_id: int, chat_id,
     first_done   = False
 
     for i, s in enumerate(stickers_data):
+        # 下載
         content = _download(s["url"], i)
-        if not content:
-            # 動態失敗時 fallback 靜態版
-            fallback = s.get("static_url")
-            if fallback:
-                logger.info(f"[{i}] 動態下載失敗，改用靜態")
-                content = _download(fallback, i)
-                if content:
-                    s = {**s, "is_animated": False}
-
         if not content:
             continue
 
+        # 處理圖片
         if s["is_animated"]:
             processed = await loop.run_in_executor(None, convert_to_webm, content)
             fmt = "video"
-            # ffmpeg 失敗 → 改靜態
+            # 超過 256KB 或轉檔失敗 → fallback 靜態
             if not processed:
-                logger.warning(f"[{i}] webm 轉換失敗，改靜態版")
-                static_content = _download(s.get("static_url", s["url"]), i)
-                if static_content:
-                    processed = await loop.run_in_executor(None, resize_for_telegram, static_content)
-                    fmt = "static"
+                logger.info(f"[{i}] 動圖 fallback 靜態")
+                static_bytes = _download(s.get("static_url", s["url"]), i) or content
+                processed = await loop.run_in_executor(None, resize_for_telegram, static_bytes)
+                fmt = "static"
         else:
             processed = await loop.run_in_executor(None, resize_for_telegram, content)
             fmt = "static"
@@ -334,19 +362,21 @@ async def convert_and_upload(bot, user_id: int, chat_id,
             logger.error(f"[{i}] 圖片處理最終失敗，跳過")
             continue
 
-        try:
-            sticker = InputSticker(sticker=processed, emoji_list=["✨"], format=fmt)
-            if not first_done:
-                await bot.create_new_sticker_set(
-                    user_id=user_id, name=pack_name, title=pack_title,
-                    stickers=[sticker], sticker_type="regular",
-                )
+        # 上傳（含 retry）
+        sticker = InputSticker(sticker=processed, emoji_list=["✨"], format=fmt)
+        if not first_done:
+            ok = await _tg_upload(bot, "create", status_msg,
+                                  user_id=user_id, name=pack_name,
+                                  title=pack_title, stickers=[sticker],
+                                  sticker_type="regular")
+            if ok:
                 first_done = True
-            else:
-                await bot.add_sticker_to_set(user_id=user_id, name=pack_name, sticker=sticker)
+        else:
+            ok = await _tg_upload(bot, "add", status_msg,
+                                  user_id=user_id, name=pack_name, sticker=sticker)
+
+        if ok:
             success += 1
-        except Exception as e:
-            logger.error(f"[{i}] Telegram API 失敗: {e}")
 
         await asyncio.sleep(0.3)
         if (i + 1) % 5 == 0:
