@@ -11,6 +11,7 @@ import tempfile
 import subprocess
 import requests
 import logging
+from curl_cffi import requests as chrome_requests  # 模擬 Chrome TLS 指紋
 from bs4 import BeautifulSoup
 from PIL import Image
 from telegram import InputSticker
@@ -222,7 +223,24 @@ def _fetch_stickershop(url: str) -> "list[dict] | None":
     # 方法二：HTML data-preview
     # fly.io 機房 IP 被 LINE 過濾，優先透過 Cloudflare Worker 代理
     def _fetch_html(target_url: str) -> str | None:
-        # 方案A：ScrapingBee 住宅 IP 代理（優先）
+        # 方案A：curl_cffi 模擬 Chrome TLS 指紋（最優先，不需代理）
+        try:
+            r = chrome_requests.get(
+                target_url,
+                impersonate="chrome120",   # 完整模擬 Chrome 120 的 TLS ClientHello
+                timeout=20,
+            )
+            logger.info(f"curl_cffi chrome120 {r.status_code} for {target_url}")
+            if r.status_code == 200:
+                from bs4 import BeautifulSoup as _BS
+                # 快速確認是否有 data-preview，避免無效回應
+                if "data-preview" in r.text:
+                    return r.text
+                logger.warning("curl_cffi 回傳 200 但無 data-preview，嘗試備用方案")
+        except Exception as e:
+            logger.warning(f"curl_cffi 失敗: {e}")
+
+        # 方案B：ScrapingBee 住宅 IP（備用）
         if _SCRAPINGBEE_KEY:
             try:
                 r = requests.get(
@@ -230,35 +248,21 @@ def _fetch_stickershop(url: str) -> "list[dict] | None":
                     params={
                         "api_key": _SCRAPINGBEE_KEY,
                         "url": target_url,
-                        "render_js": "false",   # 不需要 JS 執行，省 credit
-                        "country_code": "tw",   # 台灣 IP，語系正確
+                        "render_js": "false",
+                        "country_code": "tw",
                     },
                     timeout=30,
                 )
                 logger.info(f"ScrapingBee {r.status_code} for {target_url}")
                 if r.status_code == 200:
                     return r.text
-                logger.warning(f"ScrapingBee 失敗: {r.status_code} {r.text[:200]}")
             except Exception as e:
-                logger.warning(f"ScrapingBee 例外: {e}")
+                logger.warning(f"ScrapingBee 失敗: {e}")
 
-        # 方案B：自架 Worker（備用）
-        if _PROXY_URL:
-            try:
-                proxy_req = f"{_PROXY_URL}?url={requests.utils.quote(target_url, safe='')}"
-                if _PROXY_SECRET:
-                    proxy_req += f"&secret={_PROXY_SECRET}"
-                r = requests.get(proxy_req, timeout=20)
-                logger.info(f"Worker proxy {r.status_code} for {target_url}")
-                if r.status_code == 200:
-                    return r.text
-            except Exception as e:
-                logger.warning(f"Worker proxy 失敗: {e}")
-
-        # fallback：直連（本機測試用）
+        # 方案C：直連（本機測試用）
         try:
             r = requests.get(target_url, headers=_HEADERS, timeout=20)
-            logger.info(f"直連 HTML {r.status_code}")
+            logger.info(f"直連 {r.status_code}")
             return r.text if r.status_code == 200 else None
         except Exception as e:
             logger.error(f"直連失敗: {e}")
