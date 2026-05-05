@@ -18,10 +18,12 @@ from telegram.error import RetryAfter, TimedOut, NetworkError
 
 logger = logging.getLogger(__name__)
 
-# Cloudflare Worker 代理設定（從環境變數讀取）
-# fly.io: fly secrets set LINE_PROXY_URL=https://xxx.workers.dev LINE_PROXY_SECRET=你的密碼
-_PROXY_URL    = os.environ.get("LINE_PROXY_URL", "")     # Worker 的網址
-_PROXY_SECRET = os.environ.get("LINE_PROXY_SECRET", "")  # 防濫用密碼
+# 代理設定（從環境變數讀取，兩種方案擇一）
+# 方案A：ScrapingBee（住宅IP代理，免費1000次/月）→ fly secrets set SCRAPINGBEE_KEY=xxx
+# 方案B：自架 CF Worker（已確認被 LINE 封鎖，保留供參考）
+_SCRAPINGBEE_KEY = os.environ.get("SCRAPINGBEE_KEY", "")
+_PROXY_URL       = os.environ.get("LINE_PROXY_URL", "")
+_PROXY_SECRET    = os.environ.get("LINE_PROXY_SECRET", "")
 
 _HEADERS = {
     "User-Agent": (
@@ -220,17 +222,39 @@ def _fetch_stickershop(url: str) -> "list[dict] | None":
     # 方法二：HTML data-preview
     # fly.io 機房 IP 被 LINE 過濾，優先透過 Cloudflare Worker 代理
     def _fetch_html(target_url: str) -> str | None:
-        if _PROXY_URL:
-            proxy_req = f"{_PROXY_URL}?url={requests.utils.quote(target_url, safe='')}"
-            if _PROXY_SECRET:
-                proxy_req += f"&secret={_PROXY_SECRET}"
+        # 方案A：ScrapingBee 住宅 IP 代理（優先）
+        if _SCRAPINGBEE_KEY:
             try:
+                r = requests.get(
+                    "https://app.scrapingbee.com/api/v1/",
+                    params={
+                        "api_key": _SCRAPINGBEE_KEY,
+                        "url": target_url,
+                        "render_js": "false",   # 不需要 JS 執行，省 credit
+                        "country_code": "tw",   # 台灣 IP，語系正確
+                    },
+                    timeout=30,
+                )
+                logger.info(f"ScrapingBee {r.status_code} for {target_url}")
+                if r.status_code == 200:
+                    return r.text
+                logger.warning(f"ScrapingBee 失敗: {r.status_code} {r.text[:200]}")
+            except Exception as e:
+                logger.warning(f"ScrapingBee 例外: {e}")
+
+        # 方案B：自架 Worker（備用）
+        if _PROXY_URL:
+            try:
+                proxy_req = f"{_PROXY_URL}?url={requests.utils.quote(target_url, safe='')}"
+                if _PROXY_SECRET:
+                    proxy_req += f"&secret={_PROXY_SECRET}"
                 r = requests.get(proxy_req, timeout=20)
                 logger.info(f"Worker proxy {r.status_code} for {target_url}")
                 if r.status_code == 200:
                     return r.text
             except Exception as e:
-                logger.warning(f"Worker proxy 失敗: {e}，改直連")
+                logger.warning(f"Worker proxy 失敗: {e}")
+
         # fallback：直連（本機測試用）
         try:
             r = requests.get(target_url, headers=_HEADERS, timeout=20)
