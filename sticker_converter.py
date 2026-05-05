@@ -17,7 +17,29 @@ from telegram import InputSticker
 
 logger = logging.getLogger(__name__)
 
-_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+# 完整瀏覽器 headers，避免 LINE 偵測 bot 後回傳 SPA 空殼
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+_API_HEADERS = {
+    **_HEADERS,
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://store.line.me/",
+    "Origin": "https://store.line.me",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+}
 
 
 # ── 圖片處理 ──────────────────────────────────────────────────────────────────
@@ -72,20 +94,98 @@ def convert_to_webm(image_bytes: bytes) -> "io.BytesIO | None":
             if os.path.exists(p): os.remove(p)
 
 
-# ── 下載（含 retry + log）────────────────────────────────────────────────────
+# ── 下載工具 ──────────────────────────────────────────────────────────────────
 
 def _download(url: str, index: int) -> "bytes | None":
-    for try_url in [url, url.replace("@2x", "")]:
+    for try_url in dict.fromkeys([url, url.replace("@2x", "")]):  # 去重但保順序
         try:
-            res = requests.get(try_url, headers=_HEADERS, timeout=15)
-            if res.status_code == 200:
-                logger.debug(f"[{index}] 下載成功: {try_url}")
+            res = requests.get(try_url, headers=_HEADERS, timeout=20)
+            if res.status_code == 200 and res.content:
+                logger.debug(f"[{index}] 下載成功 ({len(res.content)} bytes): {try_url}")
                 return res.content
             logger.warning(f"[{index}] HTTP {res.status_code}: {try_url}")
         except Exception as e:
-            logger.warning(f"[{index}] 下載例外: {try_url} -> {e}")
+            logger.warning(f"[{index}] 下載例外: {e} ({try_url})")
     logger.error(f"[{index}] 下載失敗，放棄此張")
     return None
+
+def _head_ok(url: str) -> bool:
+    try:
+        return requests.head(url, headers=_HEADERS, timeout=8).status_code == 200
+    except Exception:
+        return False
+
+
+# ── stickershop 解析 ───────────────────────────────────────────────────────────
+
+def _fetch_stickershop(url: str) -> "list[dict] | None":
+    """
+    優先用 LINE CDN JSON API（最快）；
+    fallback 用 HTML data-preview（需瀏覽器 headers 繞過 bot 偵測）。
+    """
+    m = re.search(r"/product/(\d+)", url)
+    product_id = m.group(1) if m else None
+
+    # 方法一：CDN JSON（舊格式，仍有部分包存在）
+    if product_id:
+        for cdn_url in [
+            f"https://stickershop.line-scdn.net/stickershop/v1/product/{product_id}/iPhone/stickers.json",
+            f"https://stickershop.line-scdn.net/stickershop/v1/product/{product_id}/iPhone/stickerSets.json",
+        ]:
+            try:
+                res = requests.get(cdn_url, headers=_HEADERS, timeout=15)
+                logger.info(f"CDN JSON {cdn_url} -> {res.status_code}")
+                if res.status_code == 200:
+                    data = res.json()
+                    stickers = []
+                    items = data if isinstance(data, list) else data.get("stickers", [])
+                    for s in items:
+                        ani = s.get("animationUrl") or s.get("popupUrl")
+                        stat = s.get("staticUrl") or s.get("staticImage")
+                        img_url = ani or stat
+                        if img_url:
+                            stickers.append({"url": img_url.split(";")[0],
+                                             "is_animated": bool(ani)})
+                    if stickers:
+                        logger.info(f"CDN JSON 成功: {len(stickers)} 張")
+                        return stickers
+            except Exception as e:
+                logger.warning(f"CDN JSON {cdn_url} 例外: {e}")
+
+    # 方法二：HTML data-preview（需完整瀏覽器 headers）
+    try:
+        res = requests.get(url, headers=_HEADERS, timeout=20)
+        logger.info(f"stickershop HTML {res.status_code}, url={url}")
+        soup = BeautifulSoup(res.text, "html.parser")
+        items = soup.find_all(attrs={"data-preview": True})
+        logger.info(f"data-preview count={len(items)}")
+
+        if items:
+            stickers = []
+            for item in items:
+                data = json.loads(item["data-preview"])
+                ani   = data.get("animationUrl")
+                popup = data.get("popupUrl")
+                stat  = data.get("staticUrl")
+                fallb = data.get("animation")
+                img_url = ani or popup or fallb or stat
+                if not img_url:
+                    continue
+                img_url = (img_url
+                           .replace("animation.png", "animation@2x.png")
+                           .replace("popup.png",     "popup@2x.png")
+                           .replace("sticker.png",   "sticker@2x.png")
+                           .split(";")[0])
+                stickers.append({"url": img_url, "is_animated": bool(ani or popup or fallb)})
+            if stickers:
+                return stickers
+
+        # 最後 fallback：印出 HTML 前 500 字供除錯
+        logger.warning(f"HTML 無 data-preview，body preview: {res.text[:500]}")
+        return None
+    except Exception as e:
+        logger.error(f"_fetch_stickershop: {e}")
+        return None
 
 
 # ── emojishop 解析 ────────────────────────────────────────────────────────────
@@ -98,17 +198,16 @@ def _fetch_emojishop(url: str) -> "list[dict] | None":
     product_id = m.group(1)
     logger.info(f"emojishop product_id={product_id}")
 
-    # 方法一：LINE JSON API（多個端點嘗試）
+    # 方法一：LINE API（多端點嘗試）
     api_candidates = [
-        f"https://store.line.me/api/v1/sticconshop/packages/{product_id}/stickers",
+        f"https://store.line.me/api/v1/emojishop/products/{product_id}",
+        f"https://store.line.me/api/v1/emojishop/products/{product_id}/stickers",
         f"https://store.line.me/api/v1/stickershop/products/{product_id}/info",
-        f"https://store.line.me/api/v1/emojishop/products/{product_id}/info",
     ]
     for api_url in api_candidates:
         try:
-            res = requests.get(api_url, headers={**_HEADERS, "Accept": "application/json",
-                               "Referer": "https://store.line.me/"}, timeout=15)
-            logger.info(f"API {api_url} -> {res.status_code}, body: {res.text[:400]}")
+            res = requests.get(api_url, headers=_API_HEADERS, timeout=15)
+            logger.info(f"API {api_url} -> {res.status_code}, body: {res.text[:300]}")
             if res.status_code == 200:
                 data = res.json()
                 raw = (data.get("stickers")
@@ -128,62 +227,47 @@ def _fetch_emojishop(url: str) -> "list[dict] | None":
         except Exception as e:
             logger.warning(f"API {api_url} 例外: {e}")
 
-    # 方法二：CDN 流水號（sticonshop）
+    # 方法二：CDN 流水號 + 偵測動態版本
+    # 靜態：{base}/{n:03d}.png
+    # 動態：{base}/{n:03d}_animation.png 或 {base}/{n:03d}@2x.png
     base = f"https://stickershop.line-scdn.net/sticonshop/v1/sticon/{product_id}/iPhone"
-    logger.info(f"emojishop CDN fallback base={base}")
-    try:
-        for first in [f"{base}/001.png", f"{base}/1.png"]:
-            chk = requests.head(first, headers=_HEADERS, timeout=8)
-            logger.info(f"CDN head {first} -> {chk.status_code}")
-            if chk.status_code == 200:
-                stickers = []
-                for n in range(1, 61):
-                    r = requests.head(f"{base}/{n:03d}.png", headers=_HEADERS, timeout=5)
-                    if r.status_code != 200:
-                        break
-                    stickers.append({"url": f"{base}/{n:03d}.png", "is_animated": False})
-                if stickers:
-                    logger.info(f"CDN fallback 找到 {len(stickers)} 張")
-                    return stickers
-    except Exception as e:
-        logger.error(f"CDN fallback 例外: {e}")
+    logger.info(f"emojishop CDN base={base}")
+
+    # 確認第一張是否存在
+    first_url = f"{base}/001.png"
+    if not _head_ok(first_url):
+        first_url = f"{base}/1.png"
+        if not _head_ok(first_url):
+            logger.error("emojishop CDN 第一張不存在，所有方法失敗")
+            return None
+
+    fmt = "001" if "001" in first_url else "1"  # 判斷命名格式
+    logger.info(f"CDN fallback 有效，格式={fmt}")
+
+    stickers = []
+    for n in range(1, 61):
+        name    = f"{n:03d}" if fmt == "001" else str(n)
+        static  = f"{base}/{name}.png"
+        ani_url = f"{base}/{name}_animation.png"  # 動態 variant
+
+        r = requests.head(static, headers=_HEADERS, timeout=5)
+        if r.status_code != 200:
+            break  # 遇到 404 表示結束
+
+        is_ani = _head_ok(ani_url)
+        stickers.append({
+            "url": ani_url if is_ani else static,
+            "static_url": static,
+            "is_animated": is_ani,
+        })
+
+    if stickers:
+        logger.info(f"CDN fallback 找到 {len(stickers)} 張（"
+                    f"動態 {sum(1 for s in stickers if s['is_animated'])} 張）")
+        return stickers
 
     logger.error("emojishop: 所有方法均失敗")
     return None
-
-
-# ── stickershop 解析 ───────────────────────────────────────────────────────────
-
-def _fetch_stickershop(url: str) -> "list[dict] | None":
-    try:
-        res = requests.get(url, headers=_HEADERS, timeout=15)
-        logger.info(f"stickershop HTTP {res.status_code}, url={url}")
-        soup = BeautifulSoup(res.text, "html.parser")
-        items = soup.find_all(attrs={"data-preview": True})
-        logger.info(f"stickershop data-preview count={len(items)}")
-        if not items:
-            return None
-        stickers = []
-        for item in items:
-            data = json.loads(item["data-preview"])
-            ani   = data.get("animationUrl")
-            popup = data.get("popupUrl")
-            stat  = data.get("staticUrl")
-            fallb = data.get("animation")
-            img_url = ani or popup or fallb or stat
-            if not img_url:
-                continue
-            img_url = (img_url
-                       .replace("animation.png", "animation@2x.png")
-                       .replace("popup.png",     "popup@2x.png")
-                       .replace("sticker.png",   "sticker@2x.png")
-                       .split(";")[0])
-            stickers.append({"url": img_url, "is_animated": bool(ani or popup or fallb)})
-        logger.info(f"stickershop 解析到 {len(stickers)} 張")
-        return stickers or None
-    except Exception as e:
-        logger.error(f"_fetch_stickershop: {e}")
-        return None
 
 
 def fetch_line_stickers(url: str) -> "list[dict] | None":
@@ -221,17 +305,33 @@ async def convert_and_upload(bot, user_id: int, chat_id,
     for i, s in enumerate(stickers_data):
         content = _download(s["url"], i)
         if not content:
+            # 動態失敗時 fallback 靜態版
+            fallback = s.get("static_url")
+            if fallback:
+                logger.info(f"[{i}] 動態下載失敗，改用靜態")
+                content = _download(fallback, i)
+                if content:
+                    s = {**s, "is_animated": False}
+
+        if not content:
             continue
 
         if s["is_animated"]:
             processed = await loop.run_in_executor(None, convert_to_webm, content)
             fmt = "video"
+            # ffmpeg 失敗 → 改靜態
+            if not processed:
+                logger.warning(f"[{i}] webm 轉換失敗，改靜態版")
+                static_content = _download(s.get("static_url", s["url"]), i)
+                if static_content:
+                    processed = await loop.run_in_executor(None, resize_for_telegram, static_content)
+                    fmt = "static"
         else:
             processed = await loop.run_in_executor(None, resize_for_telegram, content)
             fmt = "static"
 
         if not processed:
-            logger.error(f"[{i}] 圖片處理失敗，跳過")
+            logger.error(f"[{i}] 圖片處理最終失敗，跳過")
             continue
 
         try:
