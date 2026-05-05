@@ -680,6 +680,7 @@ async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: st
             await reply(update, "格式：<code>記住 [關鍵字] [內容]</code>")
             return
         kw, content = parts
+        kw = kw.strip().replace("\n", "").replace("\r", "")  # 防止換行污染清單
         existing = query_memory(user_id, kw)
         # 找完全匹配的（query_memory 用 ilike 模糊，這裡再精確比對）
         exact = next((m for m in existing if m.keyword == kw), None)
@@ -721,7 +722,8 @@ async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: st
         if not mems:
             await reply(update, "🧠 記憶庫是空的。")
         else:
-            lines = ["🧠 <b>記憶清單</b>\n"] + [f"• {m.keyword}" for m in mems]
+            valid = [m for m in mems if m.keyword and m.keyword.strip()]
+            lines = ["🧠 <b>記憶清單</b>\n"] + [f"• {m.keyword.strip()}" for m in valid]
             await reply(update, "\n".join(lines))
 
 async def cb_mem_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mem_id: int):
