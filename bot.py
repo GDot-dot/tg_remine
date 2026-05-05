@@ -510,6 +510,26 @@ async def cb_edit_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_i
     if not ev:
         await q.edit_message_text("❌ 找不到該提醒。")
         return
+    rt = ev.reminder_time.astimezone(TAIPEI_TZ)
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✏️ 改內容", callback_data=f"re:edit_content:{event_id}"),
+        InlineKeyboardButton("⏰ 改時間", callback_data=f"re:edit_time:{event_id}"),
+    ]])
+    await q.edit_message_text(
+        f"📝 <b>{ev.event_content}</b>\n"
+        f"⏰ {rt.strftime('%Y/%m/%d %H:%M')}\n\n"
+        "要修改哪個項目？",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+async def cb_edit_content_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
+    q = update.callback_query
+    await q.answer()
+    ev = get_event(event_id)
+    if not ev:
+        await q.edit_message_text("❌ 找不到該提醒。")
+        return
     user_states[update.effective_user.id] = {
         "action":   "edit_reminder_content",
         "event_id": event_id,
@@ -518,6 +538,23 @@ async def cb_edit_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_i
     await q.edit_message_text(
         f"✏️ 請輸入新的提醒內容：\n目前：{ev.event_content}\n\n"
         "💡 以 <code>+</code> 開頭可補充而非覆蓋",
+        parse_mode=ParseMode.HTML)
+
+async def cb_edit_time_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
+    q = update.callback_query
+    await q.answer()
+    ev = get_event(event_id)
+    if not ev:
+        await q.edit_message_text("❌ 找不到該提醒。")
+        return
+    rt = ev.reminder_time.astimezone(TAIPEI_TZ)
+    user_states[update.effective_user.id] = {
+        "action":   "edit_reminder_time",
+        "event_id": event_id,
+    }
+    await q.edit_message_text(
+        f"⏰ 請輸入新的提醒時間：\n目前：{rt.strftime('%Y/%m/%d %H:%M')}\n\n"
+        "格式：<code>MM/DD HH:MM</code> 或 <code>今天/明天 HH:MM</code>",
         parse_mode=ParseMode.HTML)
 
 
@@ -643,8 +680,14 @@ async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: st
             await reply(update, "格式：<code>記住 [關鍵字] [內容]</code>")
             return
         kw, content = parts
+        existing = query_memory(user_id, kw)
+        # 找完全匹配的（query_memory 用 ilike 模糊，這裡再精確比對）
+        exact = next((m for m in existing if m.keyword == kw), None)
         if save_memory(user_id, kw, content):
-            await reply(update, f"🧠 已記住：<b>{kw}</b>\n{content}")
+            if exact:
+                await reply(update, f"🔄 已更新：<b>{kw}</b>\n{content}")
+            else:
+                await reply(update, f"🧠 已記住：<b>{kw}</b>\n{content}")
         else:
             await reply(update, "❌ 儲存失敗。")
 
@@ -753,6 +796,45 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await reply(update, f"✅ 已{mode}提醒：\n{new_content}")
             else:
                 await reply(update, "❌ 更新失敗。")
+            return
+
+        elif action == "edit_reminder_time":
+            event_id = user_states.pop(user_id)["event_id"]
+            # 支援：今天/明天 HH:MM、MM/DD HH:MM、YYYY-MM-DD HH:MM
+            t = text.strip()
+            now = datetime.now(TAIPEI_TZ)
+            new_dt = None
+            for pat, delta in [("今天", 0), ("明天", 1), ("後天", 2)]:
+                m = re.match(rf"^{pat}\s*(\d{{1,2}}):(\d{{2}})$", t)
+                if m:
+                    new_dt = now.replace(hour=int(m.group(1)), minute=int(m.group(2)),
+                                         second=0, microsecond=0) + timedelta(days=delta)
+                    break
+            if not new_dt:
+                m = re.match(r"^(\d{1,2})[/\-](\d{1,2})\s+(\d{1,2}):(\d{2})$", t)
+                if m:
+                    mo, dy, hh, mm = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+                    yr = now.year if (mo, dy) >= (now.month, now.day) else now.year + 1
+                    new_dt = TAIPEI_TZ.localize(datetime(yr, mo, dy, hh, mm))
+            if not new_dt:
+                m = re.match(r"^(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})\s+(\d{1,2}):(\d{2})$", t)
+                if m:
+                    new_dt = TAIPEI_TZ.localize(datetime(int(m.group(1)), int(m.group(2)),
+                                                          int(m.group(3)), int(m.group(4)), int(m.group(5))))
+            if not new_dt:
+                await reply(update,
+                    "❌ 格式錯誤，請輸入如：\n"
+                    "<code>今天 14:00</code>　<code>明天 09:30</code>\n"
+                    "<code>05/20 18:00</code>　<code>2026-06-01 10:00</code>")
+                user_states[user_id] = {"action": "edit_reminder_time", "event_id": event_id}
+                return
+            if new_dt <= now:
+                await reply(update, "❌ 時間必須在現在之後。")
+                user_states[user_id] = {"action": "edit_reminder_time", "event_id": event_id}
+                return
+            update_reminder_time(event_id, new_dt)
+            safe_add_job(send_reminder, new_dt, [event_id], f"reminder_{event_id}")
+            await reply(update, f"✅ 已更新提醒時間：{new_dt.strftime('%Y/%m/%d %H:%M')}")
             return
 
     # 固定指令路由
@@ -888,10 +970,12 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # ── 提醒清單操作
         elif parts[0] == "re":
             action = parts[1]
-            if action == "page":    await handle_reminder_list(update, ctx, int(parts[2]))
-            elif action == "del":   await cb_delete_prompt(update, ctx, int(parts[2]))
-            elif action == "delok": await cb_delete_ok(update, ctx, int(parts[2]))
-            elif action == "edit":  await cb_edit_prompt(update, ctx, int(parts[2]))
+            if action == "page":         await handle_reminder_list(update, ctx, int(parts[2]))
+            elif action == "del":        await cb_delete_prompt(update, ctx, int(parts[2]))
+            elif action == "delok":      await cb_delete_ok(update, ctx, int(parts[2]))
+            elif action == "edit":       await cb_edit_prompt(update, ctx, int(parts[2]))
+            elif action == "edit_content": await cb_edit_content_prompt(update, ctx, int(parts[2]))
+            elif action == "edit_time":  await cb_edit_time_prompt(update, ctx, int(parts[2]))
 
         # ── 週期提醒
         elif parts[0] == "rec":
