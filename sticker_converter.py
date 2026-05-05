@@ -18,6 +18,11 @@ from telegram.error import RetryAfter, TimedOut, NetworkError
 
 logger = logging.getLogger(__name__)
 
+# Cloudflare Worker 代理設定（從環境變數讀取）
+# fly.io: fly secrets set LINE_PROXY_URL=https://xxx.workers.dev LINE_PROXY_SECRET=你的密碼
+_PROXY_URL    = os.environ.get("LINE_PROXY_URL", "")     # Worker 的網址
+_PROXY_SECRET = os.environ.get("LINE_PROXY_SECRET", "")  # 防濫用密碼
+
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -176,37 +181,68 @@ def _fetch_stickershop(url: str) -> "list[dict] | None":
     m = re.search(r"/product/(\d+)", url)
     product_id = m.group(1) if m else None
 
-    # 方法一：CDN JSON
+    # 方法一：CDN JSON（需帶 Referer 否則 LINE CDN 回 403）
     if product_id:
-        for cdn_url in [
+        cdn_candidates = [
             f"https://stickershop.line-scdn.net/stickershop/v1/product/{product_id}/iPhone/stickers.json",
             f"https://stickershop.line-scdn.net/stickershop/v1/product/{product_id}/iPhone/stickerSets.json",
-        ]:
+            f"https://stickershop.line-scdn.net/stickershop/v1/product/{product_id}/iPhone/main.json",
+            f"https://store.line.me/api/v1/stickershop/products/{product_id}/stickers",
+            f"https://store.line.me/api/v1/stickershop/products/{product_id}",
+        ]
+        for cdn_url in cdn_candidates:
             try:
-                res = requests.get(cdn_url, headers=_HEADERS, timeout=15)
+                res = requests.get(cdn_url, headers=_API_HEADERS, timeout=15)
                 logger.info(f"CDN JSON {cdn_url} -> {res.status_code}")
                 if res.status_code == 200:
                     data = res.json()
-                    items = data if isinstance(data, list) else data.get("stickers", [])
+                    # LINE CDN JSON 有多種結構
+                    items = (data if isinstance(data, list)
+                             else data.get("stickers")
+                             or data.get("stickerList")
+                             or (data.get("package") or {}).get("stickers")
+                             or [])
                     stickers = []
                     for s in items:
                         ani  = s.get("animationUrl") or s.get("popupUrl")
-                        stat = s.get("staticUrl") or s.get("staticImage")
+                        stat = s.get("staticUrl") or s.get("staticImage") or s.get("fallbackStaticUrl")
                         img_url = ani or stat
                         if img_url:
                             stickers.append({"url": img_url.split(";")[0],
                                              "is_animated": bool(ani)})
                     if stickers:
-                        logger.info(f"CDN JSON 成功: {len(stickers)} 張")
+                        logger.info(f"CDN JSON 成功: {len(stickers)} 張 ({cdn_url})")
                         return stickers
+                    logger.warning(f"CDN JSON 200 但無資料，keys={list(data.keys()) if isinstance(data, dict) else 'list'}")
             except Exception as e:
                 logger.warning(f"CDN JSON {cdn_url} 例外: {e}")
 
-    # 方法二：HTML data-preview（完整瀏覽器 headers 繞過 bot 偵測）
-    try:
-        res = requests.get(url, headers=_HEADERS, timeout=20)
-        logger.info(f"stickershop HTML {res.status_code}")
-        soup = BeautifulSoup(res.text, "html.parser")
+    # 方法二：HTML data-preview
+    # fly.io 機房 IP 被 LINE 過濾，優先透過 Cloudflare Worker 代理
+    def _fetch_html(target_url: str) -> str | None:
+        if _PROXY_URL:
+            proxy_req = f"{_PROXY_URL}?url={requests.utils.quote(target_url, safe='')}"
+            if _PROXY_SECRET:
+                proxy_req += f"&secret={_PROXY_SECRET}"
+            try:
+                r = requests.get(proxy_req, timeout=20)
+                logger.info(f"Worker proxy {r.status_code} for {target_url}")
+                if r.status_code == 200:
+                    return r.text
+            except Exception as e:
+                logger.warning(f"Worker proxy 失敗: {e}，改直連")
+        # fallback：直連（本機測試用）
+        try:
+            r = requests.get(target_url, headers=_HEADERS, timeout=20)
+            logger.info(f"直連 HTML {r.status_code}")
+            return r.text if r.status_code == 200 else None
+        except Exception as e:
+            logger.error(f"直連失敗: {e}")
+            return None
+
+    html = _fetch_html(url)
+    if html:
+        soup = BeautifulSoup(html, "html.parser")
         items = soup.find_all(attrs={"data-preview": True})
         logger.info(f"data-preview count={len(items)}")
         if items:
@@ -228,11 +264,10 @@ def _fetch_stickershop(url: str) -> "list[dict] | None":
                 stickers.append({"url": img_url, "is_animated": bool(ani or popup or fallb)})
             if stickers:
                 return stickers
-        logger.warning(f"HTML 無 data-preview，body: {res.text[:500]}")
+
+        logger.warning("HTML 無 data-preview")
         return None
-    except Exception as e:
-        logger.error(f"_fetch_stickershop: {e}")
-        return None
+
 
 
 # ── emojishop 解析 ────────────────────────────────────────────────────────────
