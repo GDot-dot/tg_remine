@@ -31,6 +31,11 @@ from scheduler import (
     remove_job, send_reminder, TAIPEI_TZ, PRIORITY_RULES,
 )
 from sticker_converter import convert_and_upload
+from handlers.tracker import (
+    handle_tracker_input, handle_tracker_list,
+    handle_monthly_cost, handle_tracker_delete,
+    TRIGGER_MAP as TRACKER_TRIGGER_MAP,
+)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -195,6 +200,15 @@ HELP_TEXT = """🤖 <b>Telegram 智慧管家</b>
 <code>記住 [關鍵字] [內容]</code>
 <code>查詢 [關鍵字]</code>
 <code>忘記 [關鍵字]</code> / <code>記憶清單</code>
+
+<b>📌 追蹤功能</b>
+<code>訂閱 Netflix 每月15號 390元</code>
+<code>合約 租約 2026/12/31 提前30天</code>
+<code>紀念日 媽媽生日 0520</code>
+<code>藥物 魚油 60顆 每天2顆</code>
+<code>追蹤清單</code> / <code>訂閱清單</code> / <code>紀念日清單</code>
+<code>每月支出</code> — 訂閱費用統計
+<code>刪除追蹤 [名稱]</code>
 
 <b>🎨 LINE 貼圖轉換</b>
 <code>貼圖轉換</code> — 開啟／關閉轉換模式
@@ -889,6 +903,17 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         asyncio.create_task(_bg_convert())
         return
+    # ── Tracker 追蹤功能 ──────────────────────────────────────────────────────
+    if text in ("追蹤清單", "訂閱清單", "合約清單", "紀念日清單", "藥物清單"):
+        await handle_tracker_list(update, ctx, text); return
+    if text in ("每月支出", "月費總計", "訂閱費用"):
+        await handle_monthly_cost(update, ctx); return
+    if text.startswith("刪除追蹤"):
+        await handle_tracker_delete(update, ctx, text[4:].strip()); return
+    if any(text.startswith(p + " ") or text.startswith(p + "\u3000")
+           for p in TRACKER_TRIGGER_MAP):
+        await handle_tracker_input(update, ctx, text); return
+
     if text in ("提醒清單", "📋 提醒清單"):
         await handle_reminder_list(update, ctx); return
     if text.startswith("重要提醒"):
@@ -1092,6 +1117,8 @@ def start():
 
     init_db()
     safe_start()
+    from scheduler import start_tracker_scan
+    start_tracker_scan()
 
     _loop = asyncio.new_event_loop()
     threading.Thread(target=_run_loop, args=(_loop,), daemon=True).start()

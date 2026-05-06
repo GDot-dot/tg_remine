@@ -146,3 +146,85 @@ def safe_start():
             scheduler.start()
             logger.info("Scheduler started.")
             threading.Thread(target=restore_jobs, daemon=True).start()
+
+# ── Tracker 每日掃描 ──────────────────────────────────────────────────────────
+
+def scan_trackers():
+    """每天 08:00 掃描所有追蹤項目，到期前發提醒"""
+    from db import get_all_trackers
+    from datetime import date, timedelta
+
+    today = datetime.now(TAIPEI_TZ).date()
+    trackers = get_all_trackers()
+
+    for t in trackers:
+        try:
+            nd = _calc_tracker_next_date(t, today)
+            if nd is None:
+                continue
+            days = (nd - today).days
+            if 0 <= days <= t.remind_days:
+                _send_tracker_alert(t, nd, days)
+        except Exception as e:
+            logger.error(f"scan_tracker id={t.id}: {e}")
+
+def _calc_tracker_next_date(t, today):
+    from datetime import date, timedelta
+    try:
+        if t.is_recurring and t.recurring_month and t.recurring_day:
+            d = today.replace(month=t.recurring_month, day=t.recurring_day)
+            if d < today:
+                d = d.replace(year=d.year + 1)
+            return d
+        if t.category == "medicine" and t.stock_total and t.stock_daily:
+            days = int(t.stock_total / t.stock_daily)
+            return t.created_at.date() + timedelta(days=days)
+        if t.expire_date:
+            d = t.expire_date
+            if t.cycle == "monthly":
+                while d < today:
+                    m = d.month + 1 if d.month < 12 else 1
+                    y = d.year if d.month < 12 else d.year + 1
+                    try:
+                        d = d.replace(year=y, month=m)
+                    except ValueError:
+                        d = d.replace(year=y, month=m, day=28)
+            elif t.cycle == "yearly":
+                while d < today:
+                    d = d.replace(year=d.year + 1)
+            return d
+    except Exception:
+        pass
+    return None
+
+def _send_tracker_alert(t, next_date, days_left):
+    icons = {"subscription": "💳", "contract": "📄", "anniversary": "🎂", "medicine": "💊"}
+    names = {"subscription": "訂閱到期", "contract": "合約到期",
+             "anniversary": "紀念日快到了", "medicine": "藥物即將耗盡"}
+    icon  = icons.get(t.category, "📌")
+    title = names.get(t.category, "提醒")
+
+    if days_left == 0:
+        dl_str = "今天！"
+    elif days_left == 1:
+        dl_str = "明天"
+    else:
+        dl_str = f"還有 {days_left} 天"
+
+    date_str = next_date.strftime("%m/%d") if t.is_recurring else next_date.strftime("%Y/%m/%d")
+
+    lines = [f"{icon} <b>{title}</b>", f"📌 {t.name}  {date_str}（{dl_str}）"]
+    if t.amount:
+        cycle_zh = {"monthly": "月", "yearly": "年"}.get(t.cycle, "")
+        lines.append(f"💰 {t.amount:.0f} 元/{cycle_zh}" if cycle_zh else f"💰 {t.amount:.0f} 元")
+    if t.category == "medicine":
+        lines.append("🛒 記得補貨！")
+
+    tg_send(t.user_id, "\n".join(lines))
+
+def start_tracker_scan():
+    """啟動每日 08:00 tracker 掃描排程"""
+    with scheduler_lock:
+        if not scheduler.get_job("daily_tracker_scan"):
+            safe_add_cron(scan_trackers, [], "daily_tracker_scan", "*", 8, 0)
+            logger.info("✅ Tracker 每日掃描排程已啟動")

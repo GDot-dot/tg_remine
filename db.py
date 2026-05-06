@@ -1,7 +1,7 @@
 # db.py
 import os, logging
-from datetime import datetime
-from sqlalchemy import (create_engine, Column, Integer, String, Float, DateTime, Text, UniqueConstraint)
+from datetime import datetime, date as date_type
+from sqlalchemy import (create_engine, Column, Integer, String, Float, DateTime, Date, Text, UniqueConstraint)
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import IntegrityError
 
@@ -48,6 +48,24 @@ class Memory(Base):
     keyword = Column(String(100), nullable=False)
     content = Column(Text, nullable=False)
     __table_args__ = (UniqueConstraint("user_id", "keyword", name="uq_user_memory"),)
+
+class Tracker(Base):
+    __tablename__ = "trackers"
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    user_id         = Column(String(50), nullable=False)
+    category        = Column(String(20), nullable=False)   # subscription/contract/anniversary/medicine
+    name            = Column(String(100), nullable=False)
+    expire_date     = Column(Date, nullable=True)           # 訂閱/合約到期日
+    is_recurring    = Column(Integer, default=0)            # 1=每年重複（紀念日）
+    recurring_month = Column(Integer, nullable=True)        # 紀念日月份
+    recurring_day   = Column(Integer, nullable=True)        # 紀念日日期
+    cycle           = Column(String(20), nullable=True)     # monthly/yearly/once
+    amount          = Column(Float, nullable=True)          # 金額
+    remind_days     = Column(Integer, default=7)            # 提前提醒天數
+    stock_total     = Column(Float, nullable=True)          # 藥物總量
+    stock_daily     = Column(Float, nullable=True)          # 藥物每日用量
+    notes           = Column(Text, nullable=True)
+    created_at      = Column(DateTime, default=datetime.utcnow)
 
 def init_db():
     Base.metadata.create_all(bind=engine)
@@ -189,5 +207,57 @@ def list_memories(user_id):
     db = SessionLocal()
     try:
         return db.query(Memory).filter(Memory.user_id == str(user_id)).all()
+    finally:
+        db.close()
+
+# ── Tracker CRUD ──────────────────────────────────────────────────────────────
+
+def add_tracker(user_id, category, name, expire_date=None, is_recurring=0,
+                recurring_month=None, recurring_day=None, cycle=None,
+                amount=None, remind_days=7, stock_total=None, stock_daily=None, notes=None):
+    db = SessionLocal()
+    try:
+        t = Tracker(
+            user_id=str(user_id), category=category, name=name,
+            expire_date=expire_date, is_recurring=is_recurring,
+            recurring_month=recurring_month, recurring_day=recurring_day,
+            cycle=cycle, amount=amount, remind_days=remind_days,
+            stock_total=stock_total, stock_daily=stock_daily, notes=notes,
+        )
+        db.add(t); db.commit(); db.refresh(t)
+        return t.id
+    except Exception as e:
+        db.rollback(); logger.error(f"add_tracker: {e}"); return None
+    finally:
+        db.close()
+
+def get_trackers(user_id, category=None):
+    db = SessionLocal()
+    try:
+        q = db.query(Tracker).filter(Tracker.user_id == str(user_id))
+        if category:
+            q = q.filter(Tracker.category == category)
+        return q.order_by(Tracker.category, Tracker.name).all()
+    finally:
+        db.close()
+
+def delete_tracker_by_name(user_id, name):
+    db = SessionLocal()
+    try:
+        rows = db.query(Tracker).filter(
+            Tracker.user_id == str(user_id),
+            Tracker.name.ilike(f"%{name}%"),
+        ).delete(synchronize_session=False)
+        db.commit(); return rows > 0
+    except Exception as e:
+        db.rollback(); logger.error(f"delete_tracker: {e}"); return False
+    finally:
+        db.close()
+
+def get_all_trackers():
+    """供 scheduler 每日掃描用"""
+    db = SessionLocal()
+    try:
+        return db.query(Tracker).all()
     finally:
         db.close()
