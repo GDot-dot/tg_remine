@@ -851,13 +851,32 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "請把 LINE 貼圖商店網址傳給我，例如：\n"
                 "https://store.line.me/stickershop/product/XXXXX")
         return
-    if "store.line.me" in text and user_id in sticker_users:
+    if "store.line.me" in text or "line.me/S/sticker" in text:
+        # 展開手機短網址
+        line_url = text.strip()
+        if "store.line.me" not in line_url:
+            try:
+                # HEAD 可能被 LINE 擋，用 GET stream 模式只取 header
+                r = requests.get(line_url, allow_redirects=True, timeout=10,
+                                 headers={"User-Agent": "Mozilla/5.0"},
+                                 stream=True)
+                r.close()
+                line_url = r.url
+                logger.info(f"短網址展開: {text.strip()} → {line_url}")
+            except Exception as e:
+                logger.warning(f"短網址展開失敗: {e}")
+        if "store.line.me" not in line_url:
+            await reply(update, "❌ 無法識別此 LINE 網址，請確認是貼圖商店的連結。")
+            return
+        if user_id not in sticker_users:
+            await reply(update, "💡 請先輸入「貼圖轉換」開啟功能，再貼網址。")
+            return
         status = await update.message.reply_text("🔍 正在抓取 LINE 網頁資料...")
 
         async def _bg_convert():
             try:
                 link = await convert_and_upload(
-                    ctx.bot, user_id, update.effective_chat.id, text.strip(), status
+                    ctx.bot, user_id, update.effective_chat.id, line_url, status
                 )
                 if link:
                     await status.edit_text(f"🎉 轉換完成！\n👉 {link}")
@@ -867,7 +886,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"sticker convert: {e}", exc_info=True)
                 await status.edit_text(f"❌ 發生錯誤：{e}")
 
-        asyncio.create_task(_bg_convert())  # 背景執行，webhook 立即 return
+        asyncio.create_task(_bg_convert())
         return
     if text in ("提醒清單", "📋 提醒清單"):
         await handle_reminder_list(update, ctx); return
