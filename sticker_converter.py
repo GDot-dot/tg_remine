@@ -138,6 +138,26 @@ def _head_ok(url: str) -> bool:
         return False
 
 
+def _sticker_urls_from_meta_item(sticker_id: int, resource_type: str, has_animation: bool) -> dict:
+    base = f"https://stickershop.line-scdn.net/stickershop/v1/sticker/{sticker_id}/iPhone"
+    static_url = f"{base}/sticker@2x.png"
+    rtype = (resource_type or "").upper()
+
+    if "POPUP" in rtype:
+        return {
+            "url": f"{base}/popup@2x.png",
+            "static_url": static_url,
+            "is_animated": True,
+        }
+    if has_animation or "ANIMATION" in rtype:
+        return {
+            "url": f"{base}/sticker_animation@2x.png",
+            "static_url": static_url,
+            "is_animated": True,
+        }
+    return {"url": static_url, "static_url": static_url, "is_animated": False}
+
+
 # ── Telegram API 發送（含 retry）─────────────────────────────────────────────
 
 async def _tg_upload(bot, action: str, status_msg, **kwargs) -> bool:
@@ -183,6 +203,37 @@ async def _tg_upload(bot, action: str, status_msg, **kwargs) -> bool:
 def _fetch_stickershop(url: str) -> "list[dict] | None":
     m = re.search(r"/product/(\d+)", url)
     product_id = m.group(1) if m else None
+
+    # 方法零：productInfo.meta
+    # 新版/動態貼圖常讓 stickers.json、store API 回 404，但 meta 仍可列出 sticker id。
+    if product_id:
+        for platform in ("iphone", "iPhone"):
+            meta_url = f"https://stickershop.line-scdn.net/stickershop/v1/product/{product_id}/{platform}/productInfo.meta"
+            try:
+                res = requests.get(meta_url, headers=_API_HEADERS, timeout=15)
+                logger.info(f"productInfo.meta {meta_url} -> {res.status_code}")
+                if res.status_code != 200:
+                    continue
+                data = res.json()
+                items = data.get("stickers") or []
+                resource_type = data.get("stickerResourceType") or ""
+                has_animation = bool(data.get("hasAnimation"))
+                stickers = []
+                for item in items:
+                    sticker_id = item.get("id") if isinstance(item, dict) else None
+                    if sticker_id:
+                        stickers.append(_sticker_urls_from_meta_item(
+                            int(sticker_id), resource_type, has_animation
+                        ))
+                if stickers:
+                    logger.info(
+                        "productInfo.meta 成功: %s 張, type=%s, animation=%s",
+                        len(stickers), resource_type, has_animation,
+                    )
+                    return stickers
+                logger.warning(f"productInfo.meta 200 但無 stickers，keys={list(data.keys())}")
+            except Exception as e:
+                logger.warning(f"productInfo.meta {meta_url} 例外: {e}")
 
     # 方法一：CDN JSON（需帶 Referer 否則 LINE CDN 回 403）
     if product_id:
@@ -405,7 +456,13 @@ async def convert_and_upload(bot, user_id: int, chat_id,
         # 下載
         content = _download(s["url"], i)
         if not content:
-            continue
+            static_url = s.get("static_url")
+            if s["is_animated"] and static_url and static_url != s["url"]:
+                logger.info(f"[{i}] 動態素材下載失敗，改抓靜態圖")
+                content = _download(static_url, i)
+                s["is_animated"] = False
+            if not content:
+                continue
 
         # 處理圖片
         if s["is_animated"]:

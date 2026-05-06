@@ -1,7 +1,7 @@
 # db.py
 import os, logging
 from datetime import datetime, date as date_type
-from sqlalchemy import (create_engine, Column, Integer, String, Float, DateTime, Date, Text, UniqueConstraint)
+from sqlalchemy import (create_engine, Column, Integer, String, Float, DateTime, Date, Text, UniqueConstraint, inspect, text as sql_text)
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import IntegrityError
 
@@ -62,14 +62,44 @@ class Tracker(Base):
     cycle           = Column(String(20), nullable=True)     # monthly/yearly/once
     amount          = Column(Float, nullable=True)          # 金額
     remind_days     = Column(Integer, default=7)            # 提前提醒天數
+    remind_time     = Column(String(5), default="08:00")    # 每日提醒時間 HH:MM
     stock_total     = Column(Float, nullable=True)          # 藥物總量
     stock_daily     = Column(Float, nullable=True)          # 藥物每日用量
     notes           = Column(Text, nullable=True)
+    last_reminded_date = Column(Date, nullable=True)        # 避免同一天重複推送
     created_at      = Column(DateTime, default=datetime.utcnow)
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    _ensure_tracker_columns()
     logger.info("✅ DB tables created/verified.")
+
+def _ensure_tracker_columns():
+    try:
+        inspector = inspect(engine)
+        if "trackers" not in inspector.get_table_names():
+            return
+        columns = {c["name"] for c in inspector.get_columns("trackers")}
+        dialect = engine.dialect.name
+        statements = []
+        if "remind_time" not in columns:
+            if dialect == "postgresql":
+                statements.append("ALTER TABLE trackers ADD COLUMN IF NOT EXISTS remind_time VARCHAR(5) DEFAULT '08:00'")
+            else:
+                statements.append("ALTER TABLE trackers ADD COLUMN remind_time VARCHAR(5) DEFAULT '08:00'")
+        if "last_reminded_date" not in columns:
+            if dialect == "postgresql":
+                statements.append("ALTER TABLE trackers ADD COLUMN IF NOT EXISTS last_reminded_date DATE")
+            else:
+                statements.append("ALTER TABLE trackers ADD COLUMN last_reminded_date DATE")
+        if not statements:
+            return
+        with engine.begin() as conn:
+            for statement in statements:
+                conn.execute(sql_text(statement))
+        logger.info("✅ Tracker columns migrated/verified.")
+    except Exception as e:
+        logger.error(f"ensure tracker columns: {e}", exc_info=True)
 
 def add_event(creator_user_id, target_id, target_type, display_name,
               content, event_datetime, is_recurring=0,
@@ -214,14 +244,15 @@ def list_memories(user_id):
 
 def add_tracker(user_id, category, name, expire_date=None, is_recurring=0,
                 recurring_month=None, recurring_day=None, cycle=None,
-                amount=None, remind_days=7, stock_total=None, stock_daily=None, notes=None):
+                amount=None, remind_days=7, remind_time="08:00",
+                stock_total=None, stock_daily=None, notes=None):
     db = SessionLocal()
     try:
         t = Tracker(
             user_id=str(user_id), category=category, name=name,
             expire_date=expire_date, is_recurring=is_recurring,
             recurring_month=recurring_month, recurring_day=recurring_day,
-            cycle=cycle, amount=amount, remind_days=remind_days,
+            cycle=cycle, amount=amount, remind_days=remind_days, remind_time=remind_time,
             stock_total=stock_total, stock_daily=stock_daily, notes=notes,
         )
         db.add(t); db.commit(); db.refresh(t)
@@ -238,6 +269,38 @@ def get_trackers(user_id, category=None):
         if category:
             q = q.filter(Tracker.category == category)
         return q.order_by(Tracker.category, Tracker.name).all()
+    finally:
+        db.close()
+
+def get_tracker_by_id(user_id, tracker_id):
+    db = SessionLocal()
+    try:
+        return db.query(Tracker).filter(
+            Tracker.user_id == str(user_id),
+            Tracker.id == tracker_id,
+        ).first()
+    finally:
+        db.close()
+
+def update_tracker(user_id, tracker_id, **fields):
+    allowed = {
+        "name", "amount", "remind_days", "remind_time", "expire_date",
+        "recurring_month", "recurring_day", "stock_total", "stock_daily",
+        "cycle", "notes", "last_reminded_date",
+    }
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return False
+    db = SessionLocal()
+    try:
+        rows = db.query(Tracker).filter(
+            Tracker.user_id == str(user_id),
+            Tracker.id == tracker_id,
+        ).update(updates, synchronize_session=False)
+        db.commit()
+        return rows > 0
+    except Exception as e:
+        db.rollback(); logger.error(f"update_tracker: {e}"); return False
     finally:
         db.close()
 
@@ -259,5 +322,19 @@ def get_all_trackers():
     db = SessionLocal()
     try:
         return db.query(Tracker).all()
+    finally:
+        db.close()
+
+def mark_tracker_reminded(tracker_id, reminded_date):
+    db = SessionLocal()
+    try:
+        rows = db.query(Tracker).filter(Tracker.id == tracker_id).update(
+            {"last_reminded_date": reminded_date},
+            synchronize_session=False,
+        )
+        db.commit()
+        return rows > 0
+    except Exception as e:
+        db.rollback(); logger.error(f"mark_tracker_reminded: {e}"); return False
     finally:
         db.close()

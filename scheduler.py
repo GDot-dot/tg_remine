@@ -1,5 +1,5 @@
 # scheduler.py
-import os, logging, threading
+import os, logging, threading, html
 from datetime import datetime, timedelta
 import requests, pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -20,7 +20,7 @@ PRIORITY_RULES = {
 jobstores    = {"default": SQLAlchemyJobStore(url=DATABASE_URL, engine_options={"pool_pre_ping": True, "pool_recycle": 300})}
 executors    = {"default": ThreadPoolExecutor(max_workers=5)}
 job_defaults = {"coalesce": True, "max_instances": 1, "misfire_grace_time": 60}
-scheduler_lock = threading.Lock()
+scheduler_lock = threading.RLock()
 scheduler = BackgroundScheduler(jobstores=jobstores, executors=executors, job_defaults=job_defaults, timezone=TAIPEI_TZ)
 
 def _tg(method, **kwargs):
@@ -150,21 +150,32 @@ def safe_start():
 # ── Tracker 每日掃描 ──────────────────────────────────────────────────────────
 
 def scan_trackers():
-    """每天 08:00 掃描所有追蹤項目，到期前發提醒"""
-    from db import get_all_trackers
+    """定期掃描追蹤項目，到期前依各項目的 remind_time 發提醒。"""
+    from db import get_all_trackers, mark_tracker_reminded
     from datetime import date, timedelta
 
-    today = datetime.now(TAIPEI_TZ).date()
+    now = datetime.now(TAIPEI_TZ)
+    today = now.date()
+    now_hhmm = now.strftime("%H:%M")
     trackers = get_all_trackers()
 
     for t in trackers:
         try:
+            remind_days = 7 if t.remind_days is None else t.remind_days
+            if remind_days < 0:
+                continue
+            remind_time = (t.remind_time or "08:00")[:5]
+            if now_hhmm < remind_time:
+                continue
+            if t.last_reminded_date == today:
+                continue
             nd = _calc_tracker_next_date(t, today)
             if nd is None:
                 continue
             days = (nd - today).days
-            if 0 <= days <= t.remind_days:
+            if 0 <= days <= remind_days:
                 _send_tracker_alert(t, nd, days)
+                mark_tracker_reminded(t.id, today)
         except Exception as e:
             logger.error(f"scan_tracker id={t.id}: {e}")
 
@@ -213,7 +224,7 @@ def _send_tracker_alert(t, next_date, days_left):
 
     date_str = next_date.strftime("%m/%d") if t.is_recurring else next_date.strftime("%Y/%m/%d")
 
-    lines = [f"{icon} <b>{title}</b>", f"📌 {t.name}  {date_str}（{dl_str}）"]
+    lines = [f"{icon} <b>{title}</b>", f"📌 {html.escape(t.name)}  {date_str}（{dl_str}）"]
     if t.amount:
         cycle_zh = {"monthly": "月", "yearly": "年"}.get(t.cycle, "")
         lines.append(f"💰 {t.amount:.0f} 元/{cycle_zh}" if cycle_zh else f"💰 {t.amount:.0f} 元")
@@ -223,8 +234,8 @@ def _send_tracker_alert(t, next_date, days_left):
     tg_send(t.user_id, "\n".join(lines))
 
 def start_tracker_scan():
-    """啟動每日 08:00 tracker 掃描排程"""
+    """啟動 tracker 掃描排程。"""
     with scheduler_lock:
         if not scheduler.get_job("daily_tracker_scan"):
-            safe_add_cron(scan_trackers, [], "daily_tracker_scan", "*", 8, 0)
+            safe_add_cron(scan_trackers, [], "daily_tracker_scan", "*", "*", "*/5")
             logger.info("✅ Tracker 每日掃描排程已啟動")

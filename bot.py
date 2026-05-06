@@ -34,6 +34,8 @@ from sticker_converter import convert_and_upload
 from handlers.tracker import (
     handle_tracker_input, handle_tracker_list,
     handle_monthly_cost, handle_tracker_delete,
+    handle_tracker_detail, handle_tracker_edit_prompt,
+    handle_tracker_toggle_notify, handle_tracker_edit_value,
     TRIGGER_MAP as TRACKER_TRIGGER_MAP,
 )
 
@@ -854,6 +856,10 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await reply(update, f"✅ 已更新提醒時間：{new_dt.strftime('%Y/%m/%d %H:%M')}")
             return
 
+        elif action == "edit_tracker_field":
+            await handle_tracker_edit_value(update, ctx, user_states, text)
+            return
+
     # 固定指令路由
     if text in ("貼圖轉換", "🎨 貼圖轉換"):
         if user_id in sticker_users:
@@ -1028,6 +1034,16 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif parts[0] == "rec":
             if parts[1] == "toggle":    await cb_rec_toggle(update, ctx, parts[2])
             elif parts[1] == "settime": await cb_rec_settime(update, ctx)
+
+        # ── 追蹤清單操作
+        elif parts[0] == "tr":
+            action = parts[1]
+            if action == "view":
+                await handle_tracker_detail(update, ctx, int(parts[2]))
+            elif action == "edit":
+                await handle_tracker_edit_prompt(update, ctx, user_states, parts[2], int(parts[3]))
+            elif action == "notify":
+                await handle_tracker_toggle_notify(update, ctx, int(parts[2]))
 
         # ── 地點
         elif parts[0] == "loc":
