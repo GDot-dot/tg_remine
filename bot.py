@@ -3,6 +3,7 @@
 
 import os
 import re
+import html
 import threading
 import asyncio
 import logging
@@ -202,6 +203,7 @@ HELP_TEXT = """🤖 <b>Telegram 智慧管家</b>
 <code>記住 [關鍵字] [內容]</code>
 <code>查詢 [關鍵字]</code>
 <code>忘記 [關鍵字]</code> / <code>記憶清單</code>
+內容格式：<code>**粗體**</code>、<code>__斜體__</code>、<code>||防劇透||</code>、<code>`等寬`</code>
 
 <b>📌 追蹤功能</b>
 <code>訂閱 Netflix 每月15號 390元</code>
@@ -222,6 +224,7 @@ HELP_TEXT = """🤖 <b>Telegram 智慧管家</b>
 _REPLY_KB = ReplyKeyboardMarkup(
     [
         ["📋 提醒清單", "🧠 記憶清單"],
+        ["📌 追蹤清單", "💳 每月支出"],
         ["📍 地點清單", "🎨 貼圖轉換"],
         ["❓ 說明"],
     ],
@@ -688,13 +691,52 @@ async def cb_loc_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE, loc_id: int
 
 # ── 記憶庫（對齊 LINE：多筆結果用按鈕選擇）──────────────────────────────────
 
+def format_memory_content(content: str) -> str:
+    """
+    將記憶內容轉成 Telegram HTML。
+    先 escape 使用者輸入，再支援常用捷徑：
+    **粗體**、__斜體__、~~刪除線~~、||防劇透||、`等寬`。
+    """
+    placeholders: list[tuple[str, str]] = []
+
+    def stash(pattern: str, repl):
+        nonlocal content
+        def _replace(m):
+            token = f"\u0000MEMFMT{len(placeholders)}\u0000"
+            placeholders.append((token, repl(m)))
+            return token
+        content = re.sub(pattern, _replace, content, flags=re.S)
+
+    stash(r"```(.+?)```", lambda m: f"<pre>{html.escape(m.group(1).strip())}</pre>")
+    stash(r"`([^`\n]+?)`", lambda m: f"<code>{html.escape(m.group(1))}</code>")
+    escaped = html.escape(content)
+    rules = [
+        (r"\*\*(.+?)\*\*", r"<b>\1</b>"),
+        (r"__(.+?)__", r"<i>\1</i>"),
+        (r"~~(.+?)~~", r"<s>\1</s>"),
+        (r"\|\|(.+?)\|\|", r"<tg-spoiler>\1</tg-spoiler>"),
+    ]
+    for pattern, replacement in rules:
+        escaped = re.sub(pattern, replacement, escaped, flags=re.S)
+    for token, value in placeholders:
+        escaped = escaped.replace(html.escape(token), value)
+    return escaped
+
+
+def memory_text(keyword: str, content: str) -> str:
+    return f"🧠 <b>{html.escape(keyword)}</b>\n{format_memory_content(content)}"
+
+
 async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     user_id = update.effective_user.id
 
     if text.startswith("記住"):
         parts = text[2:].strip().split(" ", 1)
         if len(parts) < 2:
-            await reply(update, "格式：<code>記住 [關鍵字] [內容]</code>")
+            await reply(update,
+                "格式：<code>記住 [關鍵字] [內容]</code>\n"
+                "內容可用：<code>**粗體**</code>、<code>__斜體__</code>、"
+                "<code>~~刪除線~~</code>、<code>||防劇透||</code>、<code>`等寬`</code>")
             return
         kw, content = parts
         kw = kw.strip().replace("\n", "").replace("\r", "")  # 防止換行污染清單
@@ -703,9 +745,9 @@ async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: st
         exact = next((m for m in existing if m.keyword == kw), None)
         if save_memory(user_id, kw, content):
             if exact:
-                await reply(update, f"🔄 已更新：<b>{kw}</b>\n{content}")
+                await reply(update, f"🔄 已更新：<b>{html.escape(kw)}</b>\n{format_memory_content(content)}")
             else:
-                await reply(update, f"🧠 已記住：<b>{kw}</b>\n{content}")
+                await reply(update, f"🧠 已記住：<b>{html.escape(kw)}</b>\n{format_memory_content(content)}")
         else:
             await reply(update, "❌ 儲存失敗。")
 
@@ -716,23 +758,23 @@ async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: st
             return
         results = query_memory(user_id, kw)
         if not results:
-            await reply(update, f"🔍 找不到「{kw}」的記憶。")
+            await reply(update, f"🔍 找不到「{html.escape(kw)}」的記憶。")
         elif len(results) == 1:
-            await reply(update, f"🧠 <b>{results[0].keyword}</b>\n{results[0].content}")
+            await reply(update, memory_text(results[0].keyword, results[0].content))
         else:
             # 多筆 → 按鈕選擇（對齊 LINE QuickReply 邏輯）
             btns = [[InlineKeyboardButton(m.keyword, callback_data=f"mem:view:{m.id}")]
                     for m in results]
             await reply(update,
-                f"🔍 找到 {len(results)} 筆關於「{kw}」的記憶，請選擇：",
+                f"🔍 找到 {len(results)} 筆關於「{html.escape(kw)}」的記憶，請選擇：",
                 InlineKeyboardMarkup(btns))
 
     elif text.startswith("忘記"):
         kw = text[2:].strip()
         if forget_memory(user_id, kw):
-            await reply(update, f"🗑️ 已忘記「{kw}」。")
+            await reply(update, f"🗑️ 已忘記「{html.escape(kw)}」。")
         else:
-            await reply(update, f"❌ 找不到「{kw}」。")
+            await reply(update, f"❌ 找不到「{html.escape(kw)}」。")
 
     elif text == "記憶清單":
         mems = list_memories(user_id)
@@ -740,7 +782,7 @@ async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: st
             await reply(update, "🧠 記憶庫是空的。")
         else:
             valid = [m for m in mems if m.keyword and m.keyword.strip()]
-            lines = ["🧠 <b>記憶清單</b>\n"] + [f"• {m.keyword.strip()}" for m in valid]
+            lines = ["🧠 <b>記憶清單</b>\n"] + [f"• {html.escape(m.keyword.strip())}" for m in valid]
             await reply(update, "\n".join(lines))
 
 async def cb_mem_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mem_id: int):
@@ -751,7 +793,7 @@ async def cb_mem_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mem_id: in
     mem = db.query(MemModel).filter(MemModel.id == mem_id).first()
     db.close()
     if mem:
-        await q.edit_message_text(f"🧠 <b>{mem.keyword}</b>\n{mem.content}",
+        await q.edit_message_text(memory_text(mem.keyword, mem.content),
                                    parse_mode=ParseMode.HTML)
     else:
         await q.edit_message_text("❌ 找不到。")
@@ -910,9 +952,10 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(_bg_convert())
         return
     # ── Tracker 追蹤功能 ──────────────────────────────────────────────────────
-    if text in ("追蹤清單", "訂閱清單", "合約清單", "紀念日清單", "藥物清單"):
-        await handle_tracker_list(update, ctx, text); return
-    if text in ("每月支出", "月費總計", "訂閱費用"):
+    tracker_text = text.removeprefix("📌 ").removeprefix("💳 ")
+    if tracker_text in ("追蹤清單", "訂閱清單", "合約清單", "紀念日清單", "藥物清單"):
+        await handle_tracker_list(update, ctx, tracker_text); return
+    if tracker_text in ("每月支出", "月費總計", "訂閱費用"):
         await handle_monthly_cost(update, ctx); return
     if text.startswith("刪除追蹤"):
         await handle_tracker_delete(update, ctx, text[4:].strip()); return
