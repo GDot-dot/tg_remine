@@ -468,6 +468,11 @@ async def handle_monthly_cost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     monthly = [(t.name, t.amount) for t in subs if t.amount and t.cycle == "monthly"]
     yearly  = [(t.name, t.amount) for t in subs if t.amount and t.cycle == "yearly"]
+    other   = [(t.name, t.amount) for t in subs if t.amount and t.cycle not in ("monthly", "yearly")]
+    monthly_total = sum(a for _, a in monthly)
+    yearly_total = sum(a for _, a in yearly)
+    annual_total = monthly_total * 12 + yearly_total
+    monthly_average = annual_total / 12 if annual_total else 0
 
     lines = ["💳 <b>訂閱費用統計</b>\n"]
 
@@ -475,13 +480,26 @@ async def handle_monthly_cost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append("每月：")
         for name, amt in monthly:
             lines.append(f"• {html.escape(name)}  {amt:.0f} 元")
-        lines.append(f"<b>小計：{sum(a for _, a in monthly):.0f} 元/月</b>\n")
+        lines.append(f"<b>小計：{monthly_total:.0f} 元/月</b>\n")
 
     if yearly:
         lines.append("每年：")
         for name, amt in yearly:
+            lines.append(f"• {html.escape(name)}  {amt:.0f} 元（約 {amt / 12:.0f} 元/月）")
+        lines.append(f"<b>小計：{yearly_total:.0f} 元/年</b>\n")
+
+    if other:
+        lines.append("其他：")
+        for name, amt in other:
             lines.append(f"• {html.escape(name)}  {amt:.0f} 元")
-        lines.append(f"<b>小計：{sum(a for _, a in yearly):.0f} 元/年</b>")
+        lines.append("")
+
+    if annual_total:
+        lines.append("總覽：")
+        lines.append(f"• 月費合計：{monthly_total:.0f} 元/月")
+        lines.append(f"• 年費合計：{yearly_total:.0f} 元/年")
+        lines.append(f"<b>• 年化總額：{annual_total:.0f} 元/年</b>")
+        lines.append(f"<b>• 月均成本：約 {monthly_average:.0f} 元/月</b>")
 
     await reply(update, "\n".join(lines))
 

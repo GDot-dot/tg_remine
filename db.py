@@ -225,6 +225,43 @@ def query_memory(user_id, keyword):
     finally:
         db.close()
 
+def get_memory_by_id(user_id, memory_id):
+    db = SessionLocal()
+    try:
+        return db.query(Memory).filter(
+            Memory.user_id == str(user_id),
+            Memory.id == memory_id,
+        ).first()
+    finally:
+        db.close()
+
+def update_memory_by_id(user_id, memory_id, content):
+    db = SessionLocal()
+    try:
+        rows = db.query(Memory).filter(
+            Memory.user_id == str(user_id),
+            Memory.id == memory_id,
+        ).update({"content": content}, synchronize_session=False)
+        db.commit()
+        return rows > 0
+    except Exception as e:
+        db.rollback(); logger.error(f"update_memory_by_id: {e}"); return False
+    finally:
+        db.close()
+
+def delete_memory_by_id(user_id, memory_id):
+    db = SessionLocal()
+    try:
+        rows = db.query(Memory).filter(
+            Memory.user_id == str(user_id),
+            Memory.id == memory_id,
+        ).delete(synchronize_session=False)
+        db.commit(); return rows > 0
+    except Exception as e:
+        db.rollback(); logger.error(f"delete_memory_by_id: {e}"); return False
+    finally:
+        db.close()
+
 def forget_memory(user_id, keyword):
     db = SessionLocal()
     try:
