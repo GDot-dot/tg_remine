@@ -70,7 +70,11 @@ def send_reminder(event_id):
         if not event.is_recurring:
             if event.priority_level > 0 and event.remaining_repeats > 0:
                 decrease_remaining_repeats(event_id)
-                interval = PRIORITY_RULES[event.priority_level]["interval"]
+                # 支援自訂 interval（recurrence_rule = "custom:N"）
+                if event.recurrence_rule and event.recurrence_rule.startswith("custom:"):
+                    interval = int(event.recurrence_rule.split(":")[1])
+                else:
+                    interval = PRIORITY_RULES[event.priority_level]["interval"]
                 next_run = datetime.now(TAIPEI_TZ) + timedelta(minutes=interval)
                 safe_add_job(send_reminder, next_run, [event_id], f"reminder_{event_id}")
             else:

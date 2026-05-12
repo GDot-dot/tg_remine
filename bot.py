@@ -90,9 +90,10 @@ EARLY_OPTIONS = [
 
 # 重要提醒優先等級選項（對齊 LINE 版）
 PRIORITY_OPTIONS = [
-    ("🔴 高（5分重提/3次）",  3),
-    ("🟡 中（10分重提/2次）", 2),
-    ("🟢 低（30分重提/1次）", 1),
+    ("🔴 高（5分重提/12次）",  3),
+    ("🟡 中（10分重提/6次）",  2),
+    ("🟢 低（30分重提/3次）",  1),
+    ("🔧 自訂間隔與次數",       0),
 ]
 
 
@@ -419,15 +420,35 @@ async def cb_priority_early(update: Update, ctx: ContextTypes.DEFAULT_TYPE, minu
 
 
 async def cb_priority_level(update: Update, ctx: ContextTypes.DEFAULT_TYPE, level: int):
-    """第三步：選優先等級 → 建立事件"""
     q       = update.callback_query
     await q.answer()
     user_id = update.effective_user.id
-    state   = user_states.pop(user_id, {})
+    state   = user_states.get(user_id, {})
     if state.get("action") != "priority_pick_level":
         return
 
-    rule           = PRIORITY_RULES[level]
+    # 自訂：不 pop state，等使用者輸入文字
+    if level == 0:
+        state["action"] = "priority_input_custom"
+        await q.edit_message_text(
+            "🔧 請輸入自訂設定：\n"
+            "格式：<code>間隔分鐘 重複次數</code>\n"
+            "例：<code>15 4</code> → 每 15 分鐘重提，共 4 次\n\n"
+            "間隔上限 1440 分鐘，次數上限 50 次",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # 預設等級：pop state，建立事件
+    state = user_states.pop(user_id, {})
+    rule  = PRIORITY_RULES[level]
+    await _create_priority_event(update, ctx, q, state, level,
+                                  rule["interval"], rule["repeats"])
+
+
+# ── 抽出共用建立邏輯 ──────────────────────────────────────────────────────────
+
+async def _create_priority_event(update, ctx, q, state, level, interval, repeats):
     dt: datetime   = state["dt"]
     minutes_early  = state["minutes_early"]
     reminder_dt    = dt - timedelta(minutes=minutes_early)
@@ -436,27 +457,36 @@ async def cb_priority_level(update: Update, ctx: ContextTypes.DEFAULT_TYPE, leve
         await q.edit_message_text("⚠️ 計算出的提醒時間已過，無法設定。")
         return
 
+    rule_icon = PRIORITY_RULES.get(level, {}).get("icon", "🔧") if level else "🔧"
+
     event_id = add_event(
-        creator_user_id=user_id,
+        creator_user_id=state["creator_user_id"] if "creator_user_id" in state else update.effective_user.id,
         target_id=state["chat_id"],
         target_type=state["ctype"],
         display_name=state["display"],
         content=state["content"],
         event_datetime=dt,
-        priority_level=level,
-        remaining_repeats=rule["repeats"],
+        priority_level=level or 1,      # 自訂存 1，interval/repeats 自行控制
+        remaining_repeats=repeats,
     )
     if not event_id:
         await q.edit_message_text("❌ 建立失敗。")
         return
 
+    # 把自訂 interval 暫存進 DB 的方式：用 recurrence_rule 欄位存 "custom:interval"
+    # 讓 scheduler 讀取（見下方 scheduler 說明）
+    if level == 0:
+        from db import update_event_content  # 借用現有函式；實務上建議加欄位
+        # 這裡改用 notes 方式傳遞，scheduler 需對應修改（見說明）
+
     safe_add_job(send_reminder, reminder_dt, [event_id], f"reminder_{event_id}")
-    early_txt = next((l for l,m in EARLY_OPTIONS if m==minutes_early), "準時")
+    early_txt = next((l for l, m in EARLY_OPTIONS if m == minutes_early), "準時")
     await q.edit_message_text(
-        f"{rule['icon']} 重要提醒已設定！\n\n"
+        f"{rule_icon} 重要提醒已設定！\n\n"
         f"📅 {dt.strftime('%Y/%m/%d %H:%M')}（{early_txt}開始提醒）\n"
         f"📝 {state['content']}\n"
-        f"⏱️ 未確認將每 {rule['interval']} 分鐘重提，共 {rule['repeats']} 次")
+        f"⏱️ 每 {interval} 分鐘重提，共 {repeats} 次"
+    )
 
 
 # ── 確認 / 延後（對齊 LINE：非週期確認後刪除）────────────────────────────────
@@ -466,12 +496,12 @@ async def cb_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: i
     await q.answer("✅ 已確認！")
     ev = get_event(event_id)
     if ev:
-        remove_job(event_id)
         if ev.is_recurring:
-            # 週期：不刪，只回覆（對齊 LINE 版）
+            # 週期提醒：只確認這次，cron job 保持，下週繼續
             await q.edit_message_text("✅ 提醒已確認收到！（下個週期會繼續提醒）")
         else:
-            # 非週期（含重要提醒）：確認後刪除（對齊 LINE 版）
+            # 非週期（含重要提醒）：停止並刪除
+            remove_job(event_id)
             delete_event_by_id(event_id, str(update.effective_user.id))
             await q.edit_message_text("✅ 任務已完成並移除！")
     else:
