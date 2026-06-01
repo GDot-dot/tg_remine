@@ -155,6 +155,21 @@ def update_event_content(event_id, new_content):
     finally:
         db.close()
 
+def update_event_fields(event_id, **fields):
+    allowed = {
+        "event_datetime", "reminder_time", "reminder_sent", "is_recurring",
+        "recurrence_rule", "priority_level", "remaining_repeats",
+    }
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return False
+    db = SessionLocal()
+    try:
+        rows = db.query(Event).filter(Event.id == event_id).update(updates)
+        db.commit(); return rows > 0
+    finally:
+        db.close()
+
 def delete_event_by_id(event_id, user_id):
     db = SessionLocal()
     try:

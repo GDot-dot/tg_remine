@@ -36,11 +36,14 @@ def tg_send(chat_id, text, reply_markup=None):
     return _tg("sendMessage", **payload)
 
 def _confirm_kb(event_id):
-    return {"inline_keyboard": [[
-        {"text": "✅ 確認收到", "callback_data": f"cr:{event_id}"},
-        {"text": "💤 延後5分",  "callback_data": f"sn:{event_id}:5"},
-        {"text": "⏰ 延後30分", "callback_data": f"sn:{event_id}:30"},
-    ]]}
+    return {"inline_keyboard": [
+        [
+            {"text": "✅ 確認收到", "callback_data": f"cr:{event_id}"},
+            {"text": "💤 延後5分", "callback_data": f"sn:{event_id}:5"},
+            {"text": "⏰ 延後30分", "callback_data": f"sn:{event_id}:30"},
+        ],
+        [{"text": "🕒 自訂延後", "callback_data": f"snc:{event_id}"}],
+    ]}
 
 def _priority_kb(event_id):
     return {"inline_keyboard": [[{"text": "✅ 收到，停止提醒", "callback_data": f"cr:{event_id}"}]]}

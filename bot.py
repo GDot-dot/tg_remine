@@ -24,7 +24,7 @@ from db import (
     init_db,
     add_event, get_event, get_user_events,
     mark_reminder_sent, update_reminder_time,
-    update_event_content, delete_event_by_id,
+    update_event_content, update_event_fields, delete_event_by_id,
     add_location, get_locations, get_location_by_name, delete_location,
     save_memory, query_memory, get_memory_by_id, update_memory_by_id,
     delete_memory_by_id, forget_memory, list_memories,
@@ -109,6 +109,80 @@ def recurring_kb(selected: set) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("⏰ 設定時間", callback_data="rec:settime")])
     rows.append([InlineKeyboardButton("❌ 取消", callback_data="cancel")])
     return InlineKeyboardMarkup(rows)
+
+
+def parse_recurring_rule(rule: str | None) -> tuple[set[str], str]:
+    if not rule or "|" not in rule:
+        return set(), "09:00"
+    days_str, time_str = rule.split("|", 1)
+    days = {d for d in days_str.split(",") if d in WEEKDAY_CODES}
+    if not re.match(r"^\d{2}:\d{2}$", time_str or ""):
+        time_str = "09:00"
+    return days, time_str
+
+
+def weekday_names(days: set[str]) -> list[str]:
+    return [WEEKDAY_NAMES[WEEKDAY_CODES.index(d)] for d in sorted(days) if d in WEEKDAY_CODES]
+
+
+def parse_hhmm(value: str) -> str | None:
+    m = re.match(r"^(\d{1,2}):(\d{2})$", value.strip())
+    if not m:
+        return None
+    h, minute = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= minute <= 59):
+        return None
+    return f"{h:02d}:{minute:02d}"
+
+
+def parse_snooze_input(value: str) -> tuple[datetime, str] | None:
+    text = value.strip()
+    now = now_taipei()
+
+    m = re.match(r"^(?:延後\s*)?(\d{1,4})(?:\s*(?:分|分鐘|m|min))?$", text, re.I)
+    if m:
+        minutes = int(m.group(1))
+        if 1 <= minutes <= 1440:
+            return now + timedelta(minutes=minutes), f"{minutes} 分鐘"
+        return None
+
+    time_str = parse_hhmm(text)
+    if time_str:
+        hour, minute = map(int, time_str.split(":"))
+        run_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if run_at <= now:
+            run_at += timedelta(days=1)
+        return run_at, run_at.strftime("%m/%d %H:%M")
+
+    return None
+
+
+def parse_custom_reminder_time(value: str, event_dt: datetime) -> tuple[datetime, str] | None:
+    text = value.strip()
+
+    m = re.match(r"^(?:提前\s*)?(\d{1,5})(?:\s*(?:分|分鐘|m|min))?$", text, re.I)
+    if m:
+        minutes = int(m.group(1))
+        if 0 <= minutes <= 10080:
+            return event_dt - timedelta(minutes=minutes), f"提前 {minutes} 分鐘"
+        return None
+
+    time_str = parse_hhmm(text)
+    if time_str:
+        hour, minute = map(int, time_str.split(":"))
+        reminder_dt = event_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        return reminder_dt, reminder_dt.strftime("%Y/%m/%d %H:%M")
+
+    return None
+
+
+def priority_interval(ev) -> int:
+    if ev.recurrence_rule and ev.recurrence_rule.startswith("custom:"):
+        try:
+            return int(ev.recurrence_rule.split(":", 1)[1])
+        except (TypeError, ValueError):
+            pass
+    return PRIORITY_RULES.get(ev.priority_level, PRIORITY_RULES[1])["interval"]
 
 
 def reminder_list_kb(events: list, page: int = 0, page_size: int = 5):
@@ -305,6 +379,7 @@ async def handle_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: 
             rows.append(row); row = []
     if row:
         rows.append(row)
+    rows.append([InlineKeyboardButton("🕒 自訂提醒時間", callback_data=f"src:{event_id}")])
 
     markup = InlineKeyboardMarkup(rows)
     await reply(update,
@@ -348,6 +423,23 @@ async def cb_set_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     await q.edit_message_text(
         f"✅ 設定完成！\n"
         f"將於 {reminder_dt.strftime('%Y/%m/%d %H:%M')} {early_txt} 提醒您。")
+
+
+async def cb_custom_reminder_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
+    q = update.callback_query
+    await q.answer()
+    if not get_event(event_id):
+        await q.edit_message_text("❌ 找不到事件。")
+        return
+    user_states[update.effective_user.id] = {
+        "action": "reminder_custom_time",
+        "event_id": event_id,
+    }
+    await q.edit_message_text(
+        "🕒 請輸入自訂提醒時間：\n"
+        "可輸入提前分鐘數，例如 <code>45</code>、<code>提前120分鐘</code>；\n"
+        "或輸入當天提醒時間，例如 <code>09:30</code>。"
+    )
 
 
 # ── 重要提醒：兩步驟流程（對齊 LINE 版）─────────────────────────────────────
@@ -466,6 +558,7 @@ async def _create_priority_event(update, ctx, q, state, level, interval, repeats
         display_name=state["display"],
         content=state["content"],
         event_datetime=dt,
+        recurrence_rule=f"custom:{interval}" if level == 0 else None,
         priority_level=level or 1,      # 自訂存 1，interval/repeats 自行控制
         remaining_repeats=repeats,
     )
@@ -473,11 +566,7 @@ async def _create_priority_event(update, ctx, q, state, level, interval, repeats
         await q.edit_message_text("❌ 建立失敗。")
         return
 
-    # 把自訂 interval 暫存進 DB 的方式：用 recurrence_rule 欄位存 "custom:interval"
-    # 讓 scheduler 讀取（見下方 scheduler 說明）
-    if level == 0:
-        from db import update_event_content  # 借用現有函式；實務上建議加欄位
-        # 這裡改用 notes 方式傳遞，scheduler 需對應修改（見說明）
+    # 自訂 interval 會存進 recurrence_rule，scheduler 會依 custom:N 重排。
 
     safe_add_job(send_reminder, reminder_dt, [event_id], f"reminder_{event_id}")
     early_txt = next((l for l, m in EARLY_OPTIONS if m == minutes_early), "準時")
@@ -516,13 +605,29 @@ async def cb_snooze(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: in
         await q.edit_message_text("❌ 找不到事件。")
         return
     new_time = now_taipei() + timedelta(minutes=minutes)
-    update_reminder_time(event_id, new_time)
+    update_event_fields(event_id, reminder_time=new_time, reminder_sent=0)
     # 內容加上 (延) 標記（對齊 LINE 版）
     content = ev.event_content
     if not content.startswith("(延)"):
         update_event_content(event_id, f"(延) {content}")
     safe_add_job(send_reminder, new_time, [event_id], f"reminder_{event_id}")
     await q.edit_message_text(f"💤 已延後 {minutes} 分鐘\n新提醒時間：{new_time.strftime('%H:%M')}")
+
+
+async def cb_snooze_custom_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
+    q = update.callback_query
+    await q.answer()
+    if not get_event(event_id):
+        await q.edit_message_text("❌ 找不到事件。")
+        return
+    user_states[update.effective_user.id] = {
+        "action": "snooze_custom",
+        "event_id": event_id,
+    }
+    await q.edit_message_text(
+        "🕒 請輸入要延後多久，或指定提醒時間：\n"
+        "例如 15(15分鐘)、90分鐘、14:30"
+    )
 
 
 # ── 提醒清單 ─────────────────────────────────────────────────────────────────
@@ -564,14 +669,24 @@ async def cb_edit_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_i
     if not ev:
         await q.edit_message_text("❌ 找不到該提醒。")
         return
-    rt = ev.reminder_time.astimezone(TAIPEI_TZ)
-    kb = InlineKeyboardMarkup([[
+    rows = [[
         InlineKeyboardButton("✏️ 改內容", callback_data=f"re:edit_content:{event_id}"),
         InlineKeyboardButton("⏰ 改時間", callback_data=f"re:edit_time:{event_id}"),
-    ]])
+    ]]
+    if ev.priority_level > 0 and not ev.is_recurring:
+        rows.append([InlineKeyboardButton("🔁 改重提規則", callback_data=f"re:edit_priority:{event_id}")])
+    kb = InlineKeyboardMarkup(rows)
+    if ev.is_recurring:
+        days, time_str = parse_recurring_rule(ev.recurrence_rule)
+        schedule = f"每{'、'.join(weekday_names(days))} {time_str}" if days else ev.recurrence_rule
+    else:
+        rt = ev.reminder_time.astimezone(TAIPEI_TZ)
+        schedule = rt.strftime("%Y/%m/%d %H:%M")
+        if ev.priority_level > 0:
+            schedule += f"\n🔁 每 {priority_interval(ev)} 分鐘重提，剩餘 {ev.remaining_repeats} 次"
     await q.edit_message_text(
         f"📝 <b>{ev.event_content}</b>\n"
-        f"⏰ {rt.strftime('%Y/%m/%d %H:%M')}\n\n"
+        f"⏰ {schedule}\n\n"
         "要修改哪個項目？",
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
@@ -601,6 +716,17 @@ async def cb_edit_time_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, ev
     if not ev:
         await q.edit_message_text("❌ 找不到該提醒。")
         return
+    if ev.is_recurring:
+        days, _ = parse_recurring_rule(ev.recurrence_rule)
+        user_states[update.effective_user.id] = {
+            "action":   "recurring_edit_select_days",
+            "event_id": event_id,
+            "days":     days,
+        }
+        await q.edit_message_text(
+            "🔁 重新選擇要提醒的星期（可多選）：",
+            reply_markup=recurring_kb(days))
+        return
     rt = ev.reminder_time.astimezone(TAIPEI_TZ)
     user_states[update.effective_user.id] = {
         "action":   "edit_reminder_time",
@@ -609,6 +735,24 @@ async def cb_edit_time_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, ev
     await q.edit_message_text(
         f"⏰ 請輸入新的提醒時間：\n目前：{rt.strftime('%Y/%m/%d %H:%M')}\n\n"
         "格式：<code>MM/DD HH:MM</code> 或 <code>今天/明天 HH:MM</code>",
+        parse_mode=ParseMode.HTML)
+
+async def cb_edit_priority_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, event_id: int):
+    q = update.callback_query
+    await q.answer()
+    ev = get_event(event_id)
+    if not ev or ev.priority_level <= 0 or ev.is_recurring:
+        await q.edit_message_text("❌ 找不到可編輯的重要提醒。")
+        return
+    user_states[update.effective_user.id] = {
+        "action":   "edit_priority_rule",
+        "event_id": event_id,
+    }
+    await q.edit_message_text(
+        "🔁 請輸入新的重提規則：\n"
+        f"目前：每 {priority_interval(ev)} 分鐘，剩餘 {ev.remaining_repeats} 次\n\n"
+        "格式：<code>分鐘 次數</code>\n"
+        "例如：<code>15 4</code>",
         parse_mode=ParseMode.HTML)
 
 
@@ -627,8 +771,9 @@ async def cb_rec_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE, day: str
     state   = user_states.setdefault(user_id, {"action": "recurring_select_days", "days": set()})
     days: set = state.setdefault("days", set())
     days.discard(day) if day in days else days.add(day)
+    prompt = "🔁 重新選擇要提醒的星期（可多選）：" if state.get("action") == "recurring_edit_select_days" else "🔁 週期提醒設定\n請選擇要提醒的星期（可多選）："
     await q.edit_message_text(
-        "🔁 週期提醒設定\n請選擇要提醒的星期（可多選）：",
+        prompt,
         reply_markup=recurring_kb(days))
 
 async def cb_rec_settime(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -639,7 +784,10 @@ async def cb_rec_settime(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not days:
         await q.answer("⚠️ 請至少選一天！", show_alert=True)
         return
-    user_states[user_id]["action"] = "recurring_set_time"
+    if user_states[user_id].get("action") == "recurring_edit_select_days":
+        user_states[user_id]["action"] = "recurring_edit_set_time"
+    else:
+        user_states[user_id]["action"] = "recurring_set_time"
     await q.edit_message_text("⏰ 請輸入提醒時間（格式：HH:MM，如 09:00）：")
 
 async def _finish_recurring(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
@@ -970,15 +1118,78 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await reply(update, f"⚠️ 地點「{text.strip()}」已存在。")
             return
 
+        elif action == "snooze_custom":
+            state = user_states[user_id]
+            parsed = parse_snooze_input(text)
+            if not parsed:
+                await reply(update, "❌ 請輸入 1-1440 分鐘，或 HH:MM，例如 <code>15</code>、<code>14:30</code>。")
+                return
+            event_id = state["event_id"]
+            ev = get_event(event_id)
+            if not ev:
+                user_states.pop(user_id, None)
+                await reply(update, "❌ 找不到事件。")
+                return
+            new_time, label = parsed
+            update_event_fields(event_id, reminder_time=new_time, reminder_sent=0)
+            content = ev.event_content
+            if not content.startswith("(延)"):
+                update_event_content(event_id, f"(延) {content}")
+            safe_add_job(send_reminder, new_time, [event_id], f"reminder_{event_id}")
+            user_states.pop(user_id, None)
+            await reply(update, f"💤 已延後 {label}\n新提醒時間：{new_time.strftime('%Y/%m/%d %H:%M')}")
+            return
+
+        elif action == "reminder_custom_time":
+            state = user_states[user_id]
+            event_id = state["event_id"]
+            ev = get_event(event_id)
+            if not ev:
+                user_states.pop(user_id, None)
+                await reply(update, "❌ 找不到事件。")
+                return
+            event_dt = ev.event_datetime.astimezone(TAIPEI_TZ)
+            parsed = parse_custom_reminder_time(text, event_dt)
+            if not parsed:
+                await reply(update, "❌ 請輸入提前分鐘數，或 HH:MM，例如 <code>45</code>、<code>09:30</code>。")
+                return
+            reminder_dt, label = parsed
+            if reminder_dt <= now_taipei() or reminder_dt > event_dt:
+                await reply(update, "⚠️ 自訂提醒時間必須在現在之後，且不能晚於事件時間。")
+                return
+            update_event_fields(event_id, reminder_time=reminder_dt, reminder_sent=0)
+            safe_add_job(send_reminder, reminder_dt, [event_id], f"reminder_{event_id}")
+            user_states.pop(user_id, None)
+            await reply(update, f"✅ 設定完成！\n將於 {reminder_dt.strftime('%Y/%m/%d %H:%M')}（{label}）提醒您。")
+            return
+
         elif action == "recurring_set_time":
-            m = re.match(r"^(\d{1,2}):(\d{2})$", text.strip())
-            if not m:
+            time_str = parse_hhmm(text)
+            if not time_str:
                 await reply(update, "❌ 格式錯誤，請輸入 HH:MM，如 09:00")
                 return
-            h, minute = int(m.group(1)), int(m.group(2))
-            user_states[user_id]["time"]   = f"{h:02d}:{minute:02d}"
+            user_states[user_id]["time"]   = time_str
             user_states[user_id]["action"] = "recurring_input_content"
             await reply(update, "📝 請輸入提醒事項內容：")
+            return
+
+        elif action == "recurring_edit_set_time":
+            time_str = parse_hhmm(text)
+            if not time_str:
+                await reply(update, "❌ 格式錯誤，請輸入 HH:MM，如 09:00")
+                return
+            state = user_states.pop(user_id)
+            event_id = state["event_id"]
+            days: set = state.get("days", set())
+            days_str = ",".join(sorted(days))
+            h, minute = map(int, time_str.split(":"))
+            rule_str = f"{days_str}|{time_str}"
+            if update_event_fields(event_id, recurrence_rule=rule_str, reminder_time=now_taipei()):
+                remove_job(event_id)
+                safe_add_cron(send_reminder, [event_id], f"recurring_{event_id}", days_str, h, minute)
+                await reply(update, f"✅ 已更新週期提醒時間：每{'、'.join(weekday_names(days))} {time_str}")
+            else:
+                await reply(update, "❌ 更新失敗。")
             return
 
         elif action == "recurring_input_content":
@@ -1037,6 +1248,25 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             update_reminder_time(event_id, new_dt)
             safe_add_job(send_reminder, new_dt, [event_id], f"reminder_{event_id}")
             await reply(update, f"✅ 已更新提醒時間：{new_dt.strftime('%Y/%m/%d %H:%M')}")
+            return
+
+        elif action == "edit_priority_rule":
+            state = user_states.pop(user_id)
+            event_id = state["event_id"]
+            m = re.match(r"^(\d+)\s+(\d+)$", text.strip())
+            if not m:
+                await reply(update, "❌ 格式錯誤，請輸入如：<code>15 4</code>")
+                user_states[user_id] = state
+                return
+            interval, repeats = int(m.group(1)), int(m.group(2))
+            if interval <= 0 or repeats <= 0 or interval > 1440 or repeats > 50:
+                await reply(update, "❌ 分鐘需為 1-1440，次數需為 1-50。")
+                user_states[user_id] = state
+                return
+            if update_event_fields(event_id, recurrence_rule=f"custom:{interval}", remaining_repeats=repeats, reminder_sent=0):
+                await reply(update, f"✅ 已更新重要提醒：每 {interval} 分鐘重提，共 {repeats} 次")
+            else:
+                await reply(update, "❌ 更新失敗。")
             return
 
         elif action == "edit_tracker_field":
@@ -1193,10 +1423,14 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await cb_confirm(update, ctx, int(parts[1]))
         elif parts[0] == "sn":
             await cb_snooze(update, ctx, int(parts[1]), int(parts[2]))
+        elif parts[0] == "snc":
+            await cb_snooze_custom_prompt(update, ctx, int(parts[1]))
 
         # ── 一般提醒：選提早時間  sr:event_id:minutes
         elif parts[0] == "sr":
             await cb_set_reminder(update, ctx, int(parts[1]), int(parts[2]))
+        elif parts[0] == "src":
+            await cb_custom_reminder_prompt(update, ctx, int(parts[1]))
 
         # ── 重要提醒：選提早時間  pe:minutes
         elif parts[0] == "pe":
@@ -1215,6 +1449,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             elif action == "edit":       await cb_edit_prompt(update, ctx, int(parts[2]))
             elif action == "edit_content": await cb_edit_content_prompt(update, ctx, int(parts[2]))
             elif action == "edit_time":  await cb_edit_time_prompt(update, ctx, int(parts[2]))
+            elif action == "edit_priority": await cb_edit_priority_prompt(update, ctx, int(parts[2]))
 
         # ── 週期提醒
         elif parts[0] == "rec":
