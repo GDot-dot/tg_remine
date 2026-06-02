@@ -335,6 +335,27 @@ def _cwa_locations(data):
         result.extend(_cwa_as_list(_cwa_get(group, "location", "Location")))
     return result
 
+def _cwa_location_name(location):
+    return _cwa_get(location, "locationName", "LocationName")
+
+def _normalize_cwa_name(value):
+    return (value or "").strip().replace("　", "").replace(" ", "")
+
+def _find_cwa_location(locations, location_name):
+    normalized_name = _normalize_cwa_name(location_name)
+    if not normalized_name:
+        return locations[0] if locations else None
+
+    for location in locations:
+        if _cwa_location_name(location) == location_name:
+            return location
+
+    for location in locations:
+        if _normalize_cwa_name(_cwa_location_name(location)) == normalized_name:
+            return location
+
+    return None
+
 def _cwa_scalar(value):
     if value in (None, ""):
         return None
@@ -421,10 +442,10 @@ def fetch_weather_summary(city):
                 timeout=8,
             ).json()
             locations = _cwa_locations(data)
-            if not locations:
+            location = _find_cwa_location(locations, district)
+            if not location:
                 return f"🌤 中央氣象署查不到「{city}」的鄉鎮市區預報，請確認格式如：新北市淡水區。"
-            location = locations[0]
-            location_label = f"{county}{_cwa_get(location, 'locationName', 'LocationName') or district}"
+            location_label = f"{county}{_cwa_location_name(location) or district}"
             wx = (_cwa_element_values_any(location, ["天氣現象", "Wx"]) or ["天氣資料"])[0]
             pops = [_to_int(v) for v in _cwa_element_values_any(location, ["12小時降雨機率", "降雨機率", "PoP12h", "PoP"])]
             temps = [_to_int(v) for v in _cwa_element_values_any(location, ["溫度", "平均溫度", "T"])]
