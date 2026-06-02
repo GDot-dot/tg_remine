@@ -7,8 +7,6 @@ import html
 import threading
 import asyncio
 import logging
-import requests
-from collections import deque
 from datetime import datetime, timedelta
 from flask import Flask, request
 
@@ -29,7 +27,6 @@ from scheduler import (
     scheduler, safe_start, safe_add_job, safe_add_cron,
     remove_job, send_reminder, TAIPEI_TZ, PRIORITY_RULES,
 )
-from sticker_converter import convert_and_upload
 from handlers.tracker import (
     handle_tracker_input, handle_tracker_list,
     handle_monthly_cost, handle_tracker_delete,
@@ -50,6 +47,7 @@ from handlers.settings import (
     cmd_settings, handle_settings_callback, handle_settings_state,
     show_settings,
 )
+from handlers.stickers import handle_sticker_toggle, handle_sticker_url
 from telegraph_pages import publish_telegraph_list_page
 
 logging.basicConfig(level=logging.INFO,
@@ -64,9 +62,6 @@ app = Flask(__name__)
 _loop: asyncio.AbstractEventLoop = None
 _ptb_app: Application = None
 user_states: dict[int, dict] = {}
-sticker_users: set[int] = set()  # 已開啟貼圖轉換模式的 user_id
-sticker_queues: dict[int, deque] = {}
-sticker_queue_active: set[int] = set()
 
 
 # ── asyncio bridge ────────────────────────────────────────────────────────────
@@ -835,30 +830,6 @@ async def _finish_recurring(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         f"✅ 週期提醒已設定！\n\n📆 每{'、'.join(day_names)} {time_str}\n📝 {content}")
 
 
-async def run_sticker_queue(user_id: int):
-    queue = sticker_queues.setdefault(user_id, deque())
-    try:
-        while queue:
-            bot, chat_id, line_url, status = queue.popleft()
-            try:
-                await status.edit_text("🔍 正在抓取 LINE 網頁資料...")
-                link = await convert_and_upload(bot, user_id, chat_id, line_url, status)
-                if link:
-                    await status.edit_text(f"🎉 轉換完成！\n👉 {link}")
-                else:
-                    await status.edit_text("❌ 找不到貼圖資料，請確認網址是否正確。")
-            except Exception as e:
-                logger.error(f"sticker convert: {e}", exc_info=True)
-                try:
-                    await status.edit_text(f"❌ 發生錯誤：{e}")
-                except Exception:
-                    pass
-    finally:
-        sticker_queue_active.discard(user_id)
-        if not queue:
-            sticker_queues.pop(user_id, None)
-
-
 # ── 主訊息 Handler ────────────────────────────────────────────────────────────
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1062,44 +1033,9 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send_web_lists_link(update, ctx)
         return
     if text in ("貼圖轉換", "🎨 貼圖轉換"):
-        if user_id in sticker_users:
-            sticker_users.discard(user_id)
-            await reply(update, "🔴 貼圖轉換模式已關閉。")
-        else:
-            sticker_users.add(user_id)
-            await reply(update,
-                "🟢 貼圖轉換模式已開啟！\n"
-                "請把 LINE 貼圖商店網址傳給我，例如：\n"
-                "https://store.line.me/stickershop/product/XXXXX")
+        await handle_sticker_toggle(update, ctx)
         return
-    if "store.line.me" in text or "line.me/S/sticker" in text:
-        # 展開手機短網址
-        line_url = text.strip()
-        if "store.line.me" not in line_url:
-            try:
-                # HEAD 可能被 LINE 擋，用 GET stream 模式只取 header
-                r = requests.get(line_url, allow_redirects=True, timeout=10,
-                                 headers={"User-Agent": "Mozilla/5.0"},
-                                 stream=True)
-                r.close()
-                line_url = r.url
-                logger.info(f"短網址展開: {text.strip()} → {line_url}")
-            except Exception as e:
-                logger.warning(f"短網址展開失敗: {e}")
-        if "store.line.me" not in line_url:
-            await reply(update, "❌ 無法識別此 LINE 網址，請確認是貼圖商店的連結。")
-            return
-        if user_id not in sticker_users:
-            await reply(update, "💡 請先輸入「貼圖轉換」開啟功能，再貼網址。")
-            return
-        queue = sticker_queues.setdefault(user_id, deque())
-        position = len(queue) + (1 if user_id in sticker_queue_active else 0)
-        status_text = "🔍 正在抓取 LINE 網頁資料..." if position == 0 else f"⏳ 已加入轉換佇列，目前前面有 {position} 個任務。"
-        status = await update.message.reply_text(status_text)
-        queue.append((ctx.bot, update.effective_chat.id, line_url, status))
-        if user_id not in sticker_queue_active:
-            sticker_queue_active.add(user_id)
-            asyncio.create_task(run_sticker_queue(user_id))
+    if await handle_sticker_url(update, ctx, text):
         return
     # ── Tracker 追蹤功能 ──────────────────────────────────────────────────────
     tracker_text = text.removeprefix("📌 ").removeprefix("💳 ")
@@ -1179,17 +1115,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             elif cmd == "設定中心":
                 await show_settings(update, ctx)
             elif cmd == "貼圖轉換":
-                uid = update.effective_user.id
-                if uid in sticker_users:
-                    sticker_users.discard(uid)
-                    await q.message.reply_text("🔴 貼圖轉換模式已關閉。")
-                else:
-                    sticker_users.add(uid)
-                    await q.message.reply_text(
-                        "🟢 貼圖轉換模式已開啟！\n"
-                        "請把 LINE 貼圖商店網址傳給我，例如：\n"
-                        "https://store.line.me/stickershop/product/XXXXX"
-                    )
+                await handle_sticker_toggle(update, ctx)
             elif cmd == "說明":
                 await q.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
             return
