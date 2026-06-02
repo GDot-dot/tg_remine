@@ -49,6 +49,20 @@ class Memory(Base):
     content = Column(Text, nullable=False)
     __table_args__ = (UniqueConstraint("user_id", "keyword", name="uq_user_memory"),)
 
+class UserSetting(Base):
+    __tablename__ = "user_settings"
+    id                        = Column(Integer, primary_key=True, autoincrement=True)
+    user_id                   = Column(String(50), nullable=False, unique=True)
+    city                      = Column(String(100), default="台北")
+    weather_enabled           = Column(Integer, default=1)
+    morning_summary_enabled   = Column(Integer, default=1)
+    evening_summary_enabled   = Column(Integer, default=1)
+    morning_summary_time      = Column(String(5), default="08:00")
+    evening_summary_time      = Column(String(5), default="21:30")
+    snooze_buttons            = Column(String(50), default="5,30,60")
+    last_morning_summary_date = Column(Date, nullable=True)
+    last_evening_summary_date = Column(Date, nullable=True)
+
 class Tracker(Base):
     __tablename__ = "trackers"
     id              = Column(Integer, primary_key=True, autoincrement=True)
@@ -184,6 +198,49 @@ def decrease_remaining_repeats(event_id):
         ev = db.query(Event).filter(Event.id == event_id).first()
         if ev and ev.remaining_repeats > 0:
             ev.remaining_repeats -= 1; db.commit()
+    finally:
+        db.close()
+
+def get_user_setting(user_id):
+    db = SessionLocal()
+    try:
+        setting = db.query(UserSetting).filter(UserSetting.user_id == str(user_id)).first()
+        if setting:
+            return setting
+        setting = UserSetting(user_id=str(user_id))
+        db.add(setting); db.commit(); db.refresh(setting)
+        db.expunge(setting)
+        return setting
+    finally:
+        db.close()
+
+def update_user_setting(user_id, **fields):
+    allowed = {
+        "city", "weather_enabled", "morning_summary_enabled", "evening_summary_enabled",
+        "morning_summary_time", "evening_summary_time", "snooze_buttons",
+        "last_morning_summary_date", "last_evening_summary_date",
+    }
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return False
+    db = SessionLocal()
+    try:
+        setting = db.query(UserSetting).filter(UserSetting.user_id == str(user_id)).first()
+        if not setting:
+            setting = UserSetting(user_id=str(user_id))
+            db.add(setting)
+            db.flush()
+        for key, value in updates.items():
+            setattr(setting, key, value)
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+def list_user_settings():
+    db = SessionLocal()
+    try:
+        return db.query(UserSetting).all()
     finally:
         db.close()
 

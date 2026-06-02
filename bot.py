@@ -27,10 +27,12 @@ from db import (
     add_location, get_locations, get_location_by_name, delete_location,
     save_memory, query_memory, get_memory_by_id, update_memory_by_id,
     delete_memory_by_id, forget_memory, list_memories,
+    get_user_setting, update_user_setting,
 )
 from scheduler import (
     scheduler, safe_start, safe_add_job, safe_add_cron,
     remove_job, send_reminder, TAIPEI_TZ, PRIORITY_RULES,
+    fetch_weather_summary, build_daily_summary,
 )
 from sticker_converter import convert_and_upload
 from handlers.tracker import (
@@ -296,6 +298,11 @@ HELP_TEXT = """🤖 <b>Telegram 智慧管家</b>
 <code>貼圖轉換</code> — 開啟／關閉轉換模式
 開啟後貼上 LINE 商店網址即自動轉換至 Telegram
 
+<b>⚙️ 設定中心</b>
+<code>設定</code> / <code>/settings</code>
+可設定地區/城市、早上今日摘要、晚上明日預告、是否附上天氣、常用延後按鈕。
+天氣來源只使用中央氣象署 CWA；包含天氣狀態、最高/最低溫、降雨機率、出門建議。
+
 <b>通用</b>：<code>取消</code> — 中斷操作"""
 
 # 浮動快捷鍵盤（Reply Keyboard）
@@ -304,7 +311,7 @@ _REPLY_KB = ReplyKeyboardMarkup(
         ["📋 提醒清單", "🧠 記憶清單"],
         ["📌 追蹤清單", "💳 每月支出"],
         ["📍 地點清單", "🎨 貼圖轉換"],
-        ["❓ 說明"],
+        ["⚙️ 設定中心", "❓ 說明"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -319,6 +326,142 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reply(update, HELP_TEXT)
+
+
+# ── 設定中心 ────────────────────────────────────────────────────────────────
+
+def _settings_text(user_id: int) -> str:
+    s = get_user_setting(user_id)
+    weather = "開啟" if s.weather_enabled else "關閉"
+    morning = s.morning_summary_time if s.morning_summary_enabled else "關閉"
+    evening = s.evening_summary_time if s.evening_summary_enabled else "關閉"
+    snooze = "、".join(f"{m}分" for m in _parse_snooze_setting(s.snooze_buttons))
+    return (
+        "⚙️ <b>設定中心</b>\n\n"
+        f"📍 地區/城市：{html.escape(s.city or '台北')}\n"
+        f"🌅 今日摘要：{morning}\n"
+        f"🌙 明日預告：{evening}\n"
+        f"🌦 天氣資訊：{weather}\n"
+        f"💤 常用延後：{snooze}\n\n"
+        "天氣來源只使用中央氣象署 CWA；包含天氣狀態、最高/最低溫、降雨機率、出門建議。"
+    )
+
+def _settings_kb(user_id: int) -> InlineKeyboardMarkup:
+    s = get_user_setting(user_id)
+    weather_label = "🌦 關閉天氣" if s.weather_enabled else "🌦 開啟天氣"
+    morning_label = "🌅 關閉今日摘要" if s.morning_summary_enabled else "🌅 開啟今日摘要"
+    evening_label = "🌙 關閉明日預告" if s.evening_summary_enabled else "🌙 開啟明日預告"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📍 修改地區", callback_data="set:city")],
+        [
+            InlineKeyboardButton("🌅 早上時間", callback_data="set:morning_time"),
+            InlineKeyboardButton(morning_label, callback_data="set:morning_toggle"),
+        ],
+        [
+            InlineKeyboardButton("🌙 晚上時間", callback_data="set:evening_time"),
+            InlineKeyboardButton(evening_label, callback_data="set:evening_toggle"),
+        ],
+        [InlineKeyboardButton(weather_label, callback_data="set:weather_toggle")],
+        [InlineKeyboardButton("💤 常用延後按鈕", callback_data="set:snooze")],
+        [
+            InlineKeyboardButton("🌤 預覽天氣", callback_data="set:weather_preview"),
+            InlineKeyboardButton("📋 預覽摘要", callback_data="set:summary_preview"),
+        ],
+        [InlineKeyboardButton("❌ 關閉", callback_data="cancel")],
+    ])
+
+def _parse_snooze_setting(raw: str | None) -> list[int]:
+    values = []
+    for part in (raw or "5,30,60").split(","):
+        try:
+            minutes = int(part.strip())
+        except ValueError:
+            continue
+        if 1 <= minutes <= 1440 and minutes not in values:
+            values.append(minutes)
+    return values[:3] or [5, 30, 60]
+
+def _parse_snooze_setting_input(text: str) -> str | None:
+    values = []
+    for raw in re.split(r"[,，、\s]+", text.strip()):
+        if not raw:
+            continue
+        m = re.match(r"^(\d+)(小時|時|h)$", raw, re.I)
+        if m:
+            minutes = int(m.group(1)) * 60
+        else:
+            m = re.match(r"^(\d+)(分|分鐘|m|min)?$", raw, re.I)
+            if not m:
+                return None
+            minutes = int(m.group(1))
+        if not (1 <= minutes <= 1440):
+            return None
+        if minutes not in values:
+            values.append(minutes)
+    if not 1 <= len(values) <= 3:
+        return None
+    return ",".join(str(v) for v in values)
+
+async def show_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            _settings_text(user_id),
+            reply_markup=_settings_kb(user_id),
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await reply(update, _settings_text(user_id), _settings_kb(user_id))
+
+async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await show_settings(update, ctx)
+
+async def handle_settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: str):
+    q = update.callback_query
+    user_id = update.effective_user.id
+    s = get_user_setting(user_id)
+    await q.answer()
+
+    if action == "city":
+        user_states[user_id] = {"action": "setting_city"}
+        await q.edit_message_text("📍 請輸入台灣縣市，例如：台北、高雄、臺中市、宜蘭縣")
+        return
+    if action == "morning_time":
+        user_states[user_id] = {"action": "setting_morning_time"}
+        await q.edit_message_text("🌅 請輸入今日摘要時間（HH:MM），例如 <code>08:00</code>", parse_mode=ParseMode.HTML)
+        return
+    if action == "evening_time":
+        user_states[user_id] = {"action": "setting_evening_time"}
+        await q.edit_message_text("🌙 請輸入明日預告時間（HH:MM），例如 <code>21:30</code>", parse_mode=ParseMode.HTML)
+        return
+    if action == "snooze":
+        user_states[user_id] = {"action": "setting_snooze"}
+        await q.edit_message_text(
+            "💤 請輸入 1-3 個常用延後按鈕。\n"
+            "例如：<code>5 30 60</code> 或 <code>10分 1小時</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if action == "weather_toggle":
+        update_user_setting(user_id, weather_enabled=0 if s.weather_enabled else 1)
+        await show_settings(update, ctx)
+        return
+    if action == "morning_toggle":
+        update_user_setting(user_id, morning_summary_enabled=0 if s.morning_summary_enabled else 1)
+        await show_settings(update, ctx)
+        return
+    if action == "evening_toggle":
+        update_user_setting(user_id, evening_summary_enabled=0 if s.evening_summary_enabled else 1)
+        await show_settings(update, ctx)
+        return
+    if action == "weather_preview":
+        weather = fetch_weather_summary(s.city) or "暫時查不到天氣資料，請確認城市名稱。"
+        await q.message.reply_text(weather)
+        return
+    if action == "summary_preview":
+        text = build_daily_summary(user_id, now_taipei().date(), "🌅 今日摘要預覽", bool(s.weather_enabled), s.city)
+        await q.message.reply_text(text, parse_mode=ParseMode.HTML)
+        return
 
 
 # ── 提醒解析（對齊 LINE regex 邏輯）─────────────────────────────────────────
@@ -1117,6 +1260,51 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await reply(update, f"⚠️ 地點「{text.strip()}」已存在。")
             return
 
+        elif action == "setting_city":
+            city = text.strip()
+            if len(city) < 2 or len(city) > 50:
+                await reply(update, "❌ 城市名稱請輸入 2-50 個字。")
+                return
+            user_states.pop(user_id, None)
+            update_user_setting(user_id, city=city)
+            await reply(update, f"✅ 地區已更新為：{html.escape(city)}")
+            await show_settings(update, ctx)
+            return
+
+        elif action == "setting_morning_time":
+            time_str = parse_hhmm(text)
+            if not time_str:
+                await reply(update, "❌ 請輸入 HH:MM，例如 <code>08:00</code>。")
+                return
+            user_states.pop(user_id, None)
+            update_user_setting(user_id, morning_summary_time=time_str, morning_summary_enabled=1)
+            await reply(update, f"✅ 今日摘要時間已更新為：{time_str}")
+            await show_settings(update, ctx)
+            return
+
+        elif action == "setting_evening_time":
+            time_str = parse_hhmm(text)
+            if not time_str:
+                await reply(update, "❌ 請輸入 HH:MM，例如 <code>21:30</code>。")
+                return
+            user_states.pop(user_id, None)
+            update_user_setting(user_id, evening_summary_time=time_str, evening_summary_enabled=1)
+            await reply(update, f"✅ 明日預告時間已更新為：{time_str}")
+            await show_settings(update, ctx)
+            return
+
+        elif action == "setting_snooze":
+            snooze_buttons = _parse_snooze_setting_input(text)
+            if not snooze_buttons:
+                await reply(update, "❌ 請輸入 1-3 個 1-1440 分鐘內的值，例如 <code>5 30 60</code>。")
+                return
+            user_states.pop(user_id, None)
+            update_user_setting(user_id, snooze_buttons=snooze_buttons)
+            label = "、".join(f"{m}分" for m in _parse_snooze_setting(snooze_buttons))
+            await reply(update, f"✅ 常用延後按鈕已更新：{label}")
+            await show_settings(update, ctx)
+            return
+
         elif action == "snooze_custom":
             state = user_states[user_id]
             parsed = parse_snooze_input(text)
@@ -1337,6 +1525,8 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if text in ("提醒清單", "📋 提醒清單"):
         await handle_reminder_list(update, ctx); return
+    if text in ("設定", "設定中心", "⚙️ 設定中心"):
+        await show_settings(update, ctx); return
     if text.startswith("重要提醒"):
         await handle_priority_reminder(update, ctx, text); return
     if text.startswith("提醒"):
@@ -1401,6 +1591,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await handle_memory(update, ctx, "記憶清單")
             elif cmd == "地點清單":
                 await handle_location_list(update, ctx)
+            elif cmd == "設定中心":
+                await show_settings(update, ctx)
             elif cmd == "貼圖轉換":
                 uid = update.effective_user.id
                 if uid in sticker_users:
@@ -1430,6 +1622,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await cb_set_reminder(update, ctx, int(parts[1]), int(parts[2]))
         elif parts[0] == "src":
             await cb_custom_reminder_prompt(update, ctx, int(parts[1]))
+
+        elif parts[0] == "set":
+            await handle_settings_callback(update, ctx, parts[1])
 
         # ── 重要提醒：選提早時間  pe:minutes
         elif parts[0] == "pe":
@@ -1494,6 +1689,7 @@ def build_ptb_app() -> Application:
     a = Application.builder().token(BOT_TOKEN).build()
     a.add_handler(CommandHandler("start", cmd_start))
     a.add_handler(CommandHandler("help",  cmd_help))
+    a.add_handler(CommandHandler("settings", cmd_settings))
     a.add_handler(MessageHandler(filters.LOCATION, handle_location_msg))
     a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     a.add_handler(CallbackQueryHandler(handle_callback))
@@ -1556,7 +1752,8 @@ def start():
 
     init_db()
     safe_start()
-    from scheduler import start_tracker_scan
+    from scheduler import start_daily_summary_scan, start_tracker_scan
+    start_daily_summary_scan()
     start_tracker_scan()
 
     _loop = asyncio.new_event_loop()

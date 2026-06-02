@@ -5,13 +5,39 @@ import requests, pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.executors.pool import ThreadPoolExecutor
-from db import DATABASE_URL, SessionLocal, Event, mark_reminder_sent, decrease_remaining_repeats, update_event_fields
+from db import (
+    DATABASE_URL, SessionLocal, Event, mark_reminder_sent,
+    decrease_remaining_repeats, update_event_fields,
+    get_user_setting, list_user_settings, update_user_setting,
+)
 
 logger = logging.getLogger(__name__)
 TAIPEI_TZ = pytz.timezone("Asia/Taipei")
 TG_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+CWA_AUTHORIZATION = os.environ.get("CWA_AUTHORIZATION") or os.environ.get("CWA_API_KEY", "")
 TG_RETRY_DELAYS = (1, 3, 5)
 REMINDER_RETRY_DELAY = 5
+WEEKDAY_CODES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+CWA_CITY_ALIASES = {
+    "台北": "臺北市", "臺北": "臺北市", "台北市": "臺北市",
+    "新北": "新北市", "桃園": "桃園市", "台中": "臺中市", "臺中": "臺中市",
+    "台南": "臺南市", "臺南": "臺南市", "高雄": "高雄市",
+    "基隆": "基隆市", "新竹": "新竹市", "嘉義": "嘉義市",
+    "宜蘭": "宜蘭縣", "苗栗": "苗栗縣", "彰化": "彰化縣",
+    "南投": "南投縣", "雲林": "雲林縣", "屏東": "屏東縣",
+    "花蓮": "花蓮縣", "台東": "臺東縣", "臺東": "臺東縣",
+    "澎湖": "澎湖縣", "金門": "金門縣", "連江": "連江縣", "馬祖": "連江縣",
+}
+CWA_COUNTY_DATASET_IDS = {
+    "宜蘭縣": "F-D0047-001", "桃園市": "F-D0047-005", "新竹縣": "F-D0047-009",
+    "苗栗縣": "F-D0047-013", "彰化縣": "F-D0047-017", "南投縣": "F-D0047-021",
+    "雲林縣": "F-D0047-025", "嘉義縣": "F-D0047-029", "屏東縣": "F-D0047-033",
+    "臺東縣": "F-D0047-037", "花蓮縣": "F-D0047-041", "澎湖縣": "F-D0047-045",
+    "基隆市": "F-D0047-049", "新竹市": "F-D0047-053", "嘉義市": "F-D0047-057",
+    "臺北市": "F-D0047-061", "高雄市": "F-D0047-065", "新北市": "F-D0047-069",
+    "臺中市": "F-D0047-073", "臺南市": "F-D0047-077", "連江縣": "F-D0047-081",
+    "金門縣": "F-D0047-085",
+}
 
 PRIORITY_RULES = {
     1: {"icon": "🟢", "interval": 30, "repeats": 3},
@@ -84,15 +110,35 @@ def _finish_failed_reminder(db, event, reason):
         db.query(Event).filter(Event.id == event.id).delete()
         db.commit()
 
-def _confirm_kb(event_id):
-    return {"inline_keyboard": [
-        [
-            {"text": "✅ 確認收到", "callback_data": f"cr:{event_id}"},
-            {"text": "💤 延後5分", "callback_data": f"sn:{event_id}:5"},
-            {"text": "⏰ 延後30分", "callback_data": f"sn:{event_id}:30"},
-        ],
-        [{"text": "🕒 自訂延後", "callback_data": f"snc:{event_id}"}],
-    ]}
+def _parse_snooze_buttons(raw):
+    buttons = []
+    for part in (raw or "5,30,60").split(","):
+        try:
+            minutes = int(part.strip())
+        except ValueError:
+            continue
+        if 1 <= minutes <= 1440 and minutes not in buttons:
+            buttons.append(minutes)
+    return buttons[:3] or [5, 30, 60]
+
+def _snooze_label(minutes):
+    if minutes % 1440 == 0:
+        return f"延後{minutes // 1440}天"
+    if minutes % 60 == 0:
+        return f"延後{minutes // 60}小時"
+    return f"延後{minutes}分"
+
+def _confirm_kb(event):
+    event_id = event.id if hasattr(event, "id") else event
+    user_id = getattr(event, "creator_user_id", None)
+    buttons = _parse_snooze_buttons(get_user_setting(user_id).snooze_buttons) if user_id else [5, 30, 60]
+    rows = [[{"text": "✅ 確認收到", "callback_data": f"cr:{event_id}"}]]
+    rows.append([
+        {"text": f"💤 {_snooze_label(minutes)}", "callback_data": f"sn:{event_id}:{minutes}"}
+        for minutes in buttons
+    ])
+    rows.append([{"text": "🕒 自訂延後", "callback_data": f"snc:{event_id}"}])
+    return {"inline_keyboard": rows}
 
 def _priority_kb(event_id):
     return {"inline_keyboard": [[{"text": "✅ 收到，停止提醒", "callback_data": f"cr:{event_id}"}]]}
@@ -115,12 +161,12 @@ def send_reminder(event_id):
             icon = PRIORITY_RULES[event.priority_level]["icon"]
             sent, send_result = tg_send(chat_id, f"{icon} <b>重要提醒！</b>\n\n@{name}\n記得要「{content}」！\n(未確認將繼續提醒)", _priority_kb(event_id))
         elif event.is_recurring:
-            sent, send_result = tg_send(chat_id, f"⏰ 週期提醒\n\n@{name}\n記得要「{content}」喔！", _confirm_kb(event_id))
+            sent, send_result = tg_send(chat_id, f"⏰ 週期提醒\n\n@{name}\n記得要「{content}」喔！", _confirm_kb(event))
         else:
             event_dt  = event.event_datetime.astimezone(TAIPEI_TZ)
             sent, send_result = tg_send(chat_id,
                 f"⏰ 提醒時間到！\n\n@{name}\n📅 {event_dt.strftime('%Y/%m/%d %H:%M')}\n📝 {content}",
-                _confirm_kb(event_id))
+                _confirm_kb(event))
 
         if not sent:
             if not event.is_recurring:
@@ -223,6 +269,189 @@ def safe_start():
             scheduler.start()
             logger.info("Scheduler started.")
             threading.Thread(target=restore_jobs, daemon=True).start()
+
+# ── Daily summaries and weather ──────────────────────────────────────────────
+
+def _valid_hhmm(value):
+    try:
+        hour, minute = map(int, (value or "").split(":"))
+        return 0 <= hour <= 23 and 0 <= minute <= 59
+    except Exception:
+        return False
+
+def _normalize_cwa_city(city):
+    cleaned = (city or "").strip().replace("台", "臺")
+    return CWA_CITY_ALIASES.get(city, CWA_CITY_ALIASES.get(cleaned, cleaned))
+
+def _parse_cwa_location(city):
+    raw = (city or "").strip()
+    if not raw:
+        return "", ""
+    normalized = raw.replace("台", "臺")
+    parts = [p for p in normalized.replace("　", " ").split() if p]
+    if len(parts) >= 2:
+        return _normalize_cwa_city(parts[0]), parts[1]
+    for county in sorted(CWA_COUNTY_DATASET_IDS, key=len, reverse=True):
+        if normalized.startswith(county):
+            district = normalized[len(county):].strip()
+            return county, district
+    return _normalize_cwa_city(normalized), ""
+
+def _weather_advice(description, rain, temp_max, comfort=None):
+    if rain is not None and rain >= 60:
+        return "出門建議帶傘。"
+    if any(word in (description or "") for word in ("雨", "雷")):
+        return "留意雨勢，交通時間抓鬆一點。"
+    if temp_max is not None and temp_max >= 30:
+        return "天氣偏熱，記得補水防曬。"
+    if temp_max is not None and temp_max <= 18:
+        return "氣溫偏涼，可以多帶一件外套。"
+    if comfort:
+        return f"體感{comfort}。"
+    return "天氣看起來穩定。"
+
+def _cwa_element_values(location, element_name):
+    elements = location.get("weatherElement") or []
+    element = next((e for e in elements if e.get("elementName") == element_name), None)
+    if not element:
+        return []
+    return [
+        ((item.get("parameter") or {}).get("parameterName") or "").strip()
+        for item in (element.get("time") or [])
+    ]
+
+def _to_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+def fetch_weather_summary(city):
+    if not city:
+        return None
+    if not CWA_AUTHORIZATION:
+        return "🌤 尚未設定中央氣象署 CWA 授權碼，無法取得天氣。"
+    location_name = _normalize_cwa_city(city)
+    try:
+        data = requests.get(
+            "https://opendata.cwa.gov.tw/api/v1/rest/datastore/F-C0032-001",
+            params={
+                "Authorization": CWA_AUTHORIZATION,
+                "format": "JSON",
+                "locationName": location_name,
+            },
+            timeout=8,
+        ).json()
+        locations = (((data.get("records") or {}).get("location")) or [])
+        if not locations:
+            return f"🌤 中央氣象署查不到「{city}」的縣市預報，請改用縣市名稱，例如：臺北市、高雄市。"
+        location = locations[0]
+        wx = (_cwa_element_values(location, "Wx") or ["天氣資料"])[0]
+        pops = [_to_int(v) for v in _cwa_element_values(location, "PoP")]
+        min_ts = [_to_int(v) for v in _cwa_element_values(location, "MinT")]
+        max_ts = [_to_int(v) for v in _cwa_element_values(location, "MaxT")]
+        comfort = (_cwa_element_values(location, "CI") or [None])[0]
+        rain_values = [v for v in pops if v is not None]
+        min_values = [v for v in min_ts if v is not None]
+        max_values = [v for v in max_ts if v is not None]
+        rain = max(rain_values) if rain_values else None
+        temp_min = min(min_values) if min_values else None
+        temp_max = max(max_values) if max_values else None
+        temp = f"{temp_min}-{temp_max}°C" if temp_min is not None and temp_max is not None else "溫度未知"
+        rain_text = f"降雨機率 {rain}%" if rain is not None else "降雨機率未知"
+        return f"🌤 {location_name}今日天氣：{wx}，{temp}，{rain_text}。{_weather_advice(wx, rain, temp_max, comfort)}"
+    except Exception as e:
+        logger.warning("fetch CWA weather failed for %s: %s", city, e)
+        return "🌤 中央氣象署天氣資料暫時讀取失敗。"
+
+def _event_occurs_on(event, target_date):
+    if event.is_recurring and event.recurrence_rule:
+        try:
+            days, _ = event.recurrence_rule.split("|", 1)
+            return WEEKDAY_CODES[target_date.weekday()] in {d.strip() for d in days.split(",")}
+        except Exception:
+            return False
+    if not event.event_datetime:
+        return False
+    return event.event_datetime.astimezone(TAIPEI_TZ).date() == target_date
+
+def _event_summary_line(event):
+    content = html.escape(event.event_content or "")
+    if event.is_recurring:
+        try:
+            _, time_str = event.recurrence_rule.split("|", 1)
+        except Exception:
+            time_str = "時間未定"
+        return f"{time_str} 🔁 {content}"
+    event_dt = event.event_datetime.astimezone(TAIPEI_TZ)
+    return f"{event_dt.strftime('%H:%M')} {content}"
+
+def build_daily_summary(user_id, target_date, title, include_weather=False, city=None):
+    db = SessionLocal()
+    try:
+        events = db.query(Event).filter(
+            Event.creator_user_id == str(user_id),
+            Event.reminder_sent == 0,
+        ).all()
+        lines = []
+        if include_weather:
+            weather = fetch_weather_summary(city)
+            if weather:
+                lines.append(weather)
+                lines.append("")
+        matches = [ev for ev in events if _event_occurs_on(ev, target_date)]
+        lines.append(title)
+        if not matches:
+            lines.append("今天沒有待提醒事項。" if target_date == datetime.now(TAIPEI_TZ).date() else "這天沒有待提醒事項。")
+        else:
+            for ev in sorted(matches, key=lambda e: _event_summary_line(e)):
+                lines.append(f"• {_event_summary_line(ev)}")
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+def scan_daily_summaries():
+    now = datetime.now(TAIPEI_TZ)
+    today = now.date()
+    now_hhmm = now.strftime("%H:%M")
+    for setting in list_user_settings():
+        try:
+            if (
+                setting.morning_summary_enabled
+                and _valid_hhmm(setting.morning_summary_time)
+                and now_hhmm >= setting.morning_summary_time
+                and setting.last_morning_summary_date != today
+            ):
+                text = build_daily_summary(
+                    setting.user_id, today, "🌅 今日摘要",
+                    bool(setting.weather_enabled), setting.city,
+                )
+                sent, result = tg_send(setting.user_id, text)
+                if sent:
+                    update_user_setting(setting.user_id, last_morning_summary_date=today)
+                else:
+                    logger.warning("morning summary failed for %s: %s", setting.user_id, result)
+            tomorrow = today + timedelta(days=1)
+            if (
+                setting.evening_summary_enabled
+                and _valid_hhmm(setting.evening_summary_time)
+                and now_hhmm >= setting.evening_summary_time
+                and setting.last_evening_summary_date != today
+            ):
+                text = build_daily_summary(setting.user_id, tomorrow, "🌙 明日預告")
+                sent, result = tg_send(setting.user_id, text)
+                if sent:
+                    update_user_setting(setting.user_id, last_evening_summary_date=today)
+                else:
+                    logger.warning("evening summary failed for %s: %s", setting.user_id, result)
+        except Exception as e:
+            logger.error("scan_daily_summary user=%s: %s", getattr(setting, "user_id", "?"), e, exc_info=True)
+
+def start_daily_summary_scan():
+    with scheduler_lock:
+        if not scheduler.get_job("daily_summary_scan"):
+            safe_add_cron(scan_daily_summaries, [], "daily_summary_scan", "*", "*", "*/5")
+            logger.info("✅ 每日摘要掃描排程已啟動")
 
 # ── Tracker 每日掃描 ──────────────────────────────────────────────────────────
 
