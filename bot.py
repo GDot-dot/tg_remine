@@ -10,7 +10,7 @@ import logging
 import requests
 from collections import deque
 from datetime import datetime, timedelta
-from flask import Flask, request, render_template_string
+from flask import Flask, request
 
 import pytz
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
@@ -27,7 +27,7 @@ from db import (
     add_location, get_locations, get_location_by_name, delete_location,
     save_memory, query_memory, get_memory_by_id, update_memory_by_id,
     delete_memory_by_id, forget_memory, list_memories,
-    get_user_setting, update_user_setting, get_trackers,
+    get_user_setting, update_user_setting,
 )
 from scheduler import (
     scheduler, safe_start, safe_add_job, safe_add_cron,
@@ -42,6 +42,7 @@ from handlers.tracker import (
     handle_tracker_toggle_notify, handle_tracker_edit_value,
     TRIGGER_MAP as TRACKER_TRIGGER_MAP,
 )
+from telegraph_pages import publish_telegraph_list_page
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -311,26 +312,12 @@ _REPLY_KB = ReplyKeyboardMarkup(
         ["📋 提醒清單", "🧠 記憶清單"],
         ["📌 追蹤清單", "💳 每月支出"],
         ["📍 地點清單", "🎨 貼圖轉換"],
-        ["🌐 Web 清單", "⌨️ 隱藏鍵盤"],
+        ["📝 Telegraph 清單", "⌨️ 隱藏鍵盤"],
         ["⚙️ 設定中心", "❓ 說明"],
     ],
     resize_keyboard=True,
     is_persistent=True,
 )
-
-def _public_base_url():
-    url = WEBHOOK_URL or ""
-    if not url:
-        return ""
-    if url.endswith("/webhook"):
-        return url[:-8]
-    return url.rstrip("/")
-
-def _web_lists_url(user_id):
-    base_url = _public_base_url()
-    if not base_url:
-        return ""
-    return f"{base_url}/web/lists/{user_id}"
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -346,14 +333,17 @@ async def cmd_hide_keyboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⌨️ 已隱藏快捷鍵盤。輸入 /start 可以重新顯示。", reply_markup=ReplyKeyboardRemove())
 
 async def send_web_lists_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    url = _web_lists_url(update.effective_user.id)
-    if not url:
-        await reply(update, "🌐 WEBHOOK_URL 尚未設定，暫時無法產生 Web 清單連結。")
+    status = await update.message.reply_text("📝 正在產生 Telegraph 清單...")
+    try:
+        url = publish_telegraph_list_page(update.effective_user.id)
+    except Exception as e:
+        logger.error("publish telegraph list failed: %s", e, exc_info=True)
+        await status.edit_text(f"❌ Telegraph 清單產生失敗：{html.escape(str(e))}")
         return
     markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🌐 開啟 Web 清單", url=url)
+        InlineKeyboardButton("📝 開啟 Telegraph 清單", url=url)
     ]])
-    await reply(update, "🌐 用 Web 版查看清單紀錄：", markup)
+    await status.edit_text("📝 Telegraph 清單已產生：", reply_markup=markup)
 
 
 # ── 設定中心 ────────────────────────────────────────────────────────────────
@@ -1505,7 +1495,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text in ("顯示鍵盤", "快捷鍵盤"):
         await update.message.reply_text("⌨️ 已顯示快捷鍵盤。", reply_markup=_REPLY_KB)
         return
-    if text in ("Web 清單", "🌐 Web 清單", "網頁清單"):
+    if text in ("Telegraph 清單", "📝 Telegraph 清單", "Web 清單", "🌐 Web 清單", "網頁清單"):
         await send_web_lists_link(update, ctx)
         return
     if text in ("貼圖轉換", "🎨 貼圖轉換"):
@@ -1735,265 +1725,6 @@ def build_ptb_app() -> Application:
 
 
 # ── Flask routes ──────────────────────────────────────────────────────────────
-
-WEB_LISTS_TEMPLATE = """
-<!doctype html>
-<html lang="zh-Hant">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>清單紀錄</title>
-  <style>
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background: #fff;
-      color: #222;
-      font: 18px/1.58 Georgia, "Times New Roman", "Noto Serif TC", "PMingLiU", serif;
-    }
-    main {
-      max-width: 720px;
-      margin: 0 auto;
-      padding: 36px 18px 64px;
-    }
-    h1 {
-      margin: 0 0 6px;
-      font-size: 34px;
-      line-height: 1.16;
-      font-weight: 700;
-      letter-spacing: 0;
-    }
-    .byline {
-      color: #8b8b8b;
-      font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      margin-bottom: 30px;
-    }
-    .toc {
-      border-left: 3px solid #e6e6e6;
-      margin: 0 0 30px;
-      padding: 2px 0 2px 16px;
-      font: 15px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    .toc a {
-      color: #444;
-      display: inline-block;
-      margin-right: 12px;
-      text-decoration: none;
-    }
-    h2 {
-      border-top: 1px solid #ededed;
-      margin: 32px 0 14px;
-      padding-top: 24px;
-      font-size: 24px;
-      line-height: 1.25;
-      letter-spacing: 0;
-    }
-    h3 {
-      margin: 22px 0 8px;
-      font-size: 20px;
-      line-height: 1.3;
-    }
-    ul {
-      margin: 0 0 18px;
-      padding-left: 26px;
-    }
-    li {
-      margin: 0 0 12px;
-      overflow-wrap: anywhere;
-    }
-    .meta {
-      color: #777;
-      display: block;
-      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      margin-top: 2px;
-    }
-    .memory {
-      margin: 0 0 18px;
-      overflow-wrap: anywhere;
-    }
-    .memory-title {
-      display: block;
-      font-weight: 700;
-      margin-bottom: 3px;
-    }
-    .empty {
-      color: #888;
-      font-style: italic;
-      margin: 0 0 18px;
-    }
-    @media (max-width: 560px) {
-      main { padding-top: 28px; }
-      h1 { font-size: 30px; }
-      body { font-size: 17px; }
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>清單紀錄</h1>
-    <div class="byline">GD牌提醒機器人 · {{ generated_at }}</div>
-    <nav class="toc">
-      <a href="#reminders">提醒 {{ counts.reminders }}</a>
-      <a href="#trackers">追蹤 {{ counts.trackers }}</a>
-      <a href="#memories">記憶 {{ counts.memories }}</a>
-      <a href="#locations">地點 {{ counts.locations }}</a>
-    </nav>
-
-    <section id="reminders">
-      <h2>提醒清單</h2>
-      {% if reminders %}
-        <ul>
-        {% for ev in reminders %}
-          <li>
-            {{ ev.title }}
-            <span class="meta">{{ ev.badge }} · {{ ev.time }}</span>
-          </li>
-        {% endfor %}
-        </ul>
-      {% else %}<p class="empty">目前沒有進行中的提醒。</p>{% endif %}
-    </section>
-
-    <section id="trackers">
-      <h2>追蹤清單</h2>
-      {% if tracker_groups %}
-        {% for group in tracker_groups %}
-          <h3>{{ group.label }}</h3>
-          <ul>
-          {% for item in group.entries %}
-            <li>
-              {{ item.name }}
-              <span class="meta">{{ item.meta }}</span>
-              {% if item.notes %}<span class="meta">{{ item.notes }}</span>{% endif %}
-            </li>
-          {% endfor %}
-          </ul>
-        {% endfor %}
-      {% else %}<p class="empty">追蹤清單是空的。</p>{% endif %}
-    </section>
-
-    <section id="memories">
-      <h2>記憶清單</h2>
-      {% if memories %}
-        {% for mem in memories %}
-          <p class="memory">
-            <span class="memory-title">{{ mem.keyword }}</span>
-            {{ mem.content|safe }}
-          </p>
-        {% endfor %}
-      {% else %}<p class="empty">記憶庫是空的。</p>{% endif %}
-    </section>
-
-    <section id="locations">
-      <h2>地點清單</h2>
-      {% if locations %}
-        <ul>
-        {% for loc in locations %}
-          <li>
-            {{ loc.name }}
-            <span class="meta">{{ "%.6f"|format(loc.latitude) }}, {{ "%.6f"|format(loc.longitude) }}</span>
-            {% if loc.address %}<span class="meta">{{ loc.address }}</span>{% endif %}
-          </li>
-        {% endfor %}
-        </ul>
-      {% else %}<p class="empty">目前沒有儲存地點。</p>{% endif %}
-    </section>
-  </main>
-</body>
-</html>
-"""
-
-def _fmt_dt(value):
-    if not value:
-        return "未設定時間"
-    try:
-        return value.astimezone(TAIPEI_TZ).strftime("%Y/%m/%d %H:%M")
-    except Exception:
-        return str(value)
-
-def _web_reminders(user_id):
-    events = [
-        ev for ev in get_user_events(str(user_id))
-        if ev.is_recurring or (not ev.reminder_sent and ev.reminder_time is not None)
-    ]
-    result = []
-    for ev in events:
-        if ev.is_recurring:
-            days, time_str = parse_recurring_rule(ev.recurrence_rule)
-            day_label = "、".join(weekday_names(days)) if days else "週期"
-            time_label = f"每{day_label} {time_str}"
-            badge = "週期"
-        else:
-            time_label = _fmt_dt(ev.reminder_time)
-            badge = "重要" if ev.priority_level else "提醒"
-        result.append({"title": ev.event_content or "(無內容)", "time": time_label, "badge": badge})
-    return result
-
-def _web_memories(user_id):
-    return [
-        {
-            "keyword": (m.keyword or "").strip(),
-            "content": stored_memory_content(m.content or ""),
-        }
-        for m in list_memories(user_id)
-        if m.keyword and m.keyword.strip()
-    ]
-
-def _web_tracker_groups(user_id):
-    category_label = {
-        "subscription": "💳 訂閱",
-        "contract": "📄 合約",
-        "anniversary": "🎂 紀念日",
-        "medicine": "💊 藥物",
-    }
-    cycle_label = {"monthly": "每月", "yearly": "每年", "once": "一次"}
-    groups = []
-    trackers = get_trackers(user_id)
-    for category in ("subscription", "contract", "anniversary", "medicine"):
-        items = []
-        for t in [item for item in trackers if item.category == category]:
-            bits = []
-            if t.expire_date:
-                bits.append(f"到期 {t.expire_date.strftime('%Y/%m/%d')}")
-            if t.recurring_month and t.recurring_day:
-                bits.append(f"每年 {t.recurring_month:02d}/{t.recurring_day:02d}")
-            if t.amount is not None:
-                cycle = cycle_label.get(t.cycle, t.cycle or "")
-                bits.append(f"{t.amount:.0f} 元{('/' + cycle) if cycle else ''}")
-            if t.stock_total and t.stock_daily:
-                bits.append(f"庫存 {t.stock_total:g} / 每日 {t.stock_daily:g}")
-            if t.remind_days is not None:
-                bits.append("不提醒" if t.remind_days < 0 else f"提前 {t.remind_days} 天 {t.remind_time or '08:00'}")
-            items.append({
-                "name": t.name,
-                "badge": category_label.get(t.category, "追蹤").split(" ", 1)[-1],
-                "meta": " · ".join(bits) if bits else "未設定細節",
-                "notes": t.notes or "",
-            })
-        if items:
-            groups.append({"label": category_label.get(category, category), "entries": items})
-    return groups
-
-@app.route("/web/lists/<user_id>", methods=["GET"])
-def web_lists(user_id):
-    reminders = _web_reminders(user_id)
-    memories = _web_memories(user_id)
-    tracker_groups = _web_tracker_groups(user_id)
-    locations = get_locations(user_id)
-    counts = {
-        "reminders": len(reminders),
-        "memories": len(memories),
-        "trackers": sum(len(group["entries"]) for group in tracker_groups),
-        "locations": len(locations),
-    }
-    return render_template_string(
-        WEB_LISTS_TEMPLATE,
-        generated_at=now_taipei().strftime("%Y/%m/%d %H:%M"),
-        counts=counts,
-        reminders=reminders,
-        memories=memories,
-        tracker_groups=tracker_groups,
-        locations=locations,
-    )
 
 @app.route("/", methods=["GET"])
 def root():
