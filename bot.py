@@ -1742,177 +1742,161 @@ WEB_LISTS_TEMPLATE = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Web 清單</title>
+  <title>清單紀錄</title>
   <style>
-    :root {
-      color-scheme: dark;
-      --bg: #111820;
-      --panel: #1b2633;
-      --panel-2: #243244;
-      --text: #edf3f8;
-      --muted: #98a8b8;
-      --line: #304154;
-      --accent: #58a6ff;
-      --ok: #6ee7a7;
-      --warn: #ffd166;
-    }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font: 15px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #fff;
+      color: #222;
+      font: 18px/1.58 Georgia, "Times New Roman", "Noto Serif TC", "PMingLiU", serif;
     }
-    header {
-      position: sticky;
-      top: 0;
-      z-index: 2;
-      background: rgba(17, 24, 32, .96);
-      border-bottom: 1px solid var(--line);
-      padding: 14px 16px 10px;
+    main {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 36px 18px 64px;
     }
-    h1 { margin: 0 0 10px; font-size: 20px; letter-spacing: 0; }
-    .tabs {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 6px;
+    h1 {
+      margin: 0 0 6px;
+      font-size: 34px;
+      line-height: 1.16;
+      font-weight: 700;
+      letter-spacing: 0;
     }
-    .tab {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      color: var(--muted);
-      background: var(--panel);
-      padding: 8px 6px;
-      text-align: center;
+    .byline {
+      color: #8b8b8b;
+      font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin-bottom: 30px;
+    }
+    .toc {
+      border-left: 3px solid #e6e6e6;
+      margin: 0 0 30px;
+      padding: 2px 0 2px 16px;
+      font: 15px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .toc a {
+      color: #444;
+      display: inline-block;
+      margin-right: 12px;
       text-decoration: none;
-      font-weight: 650;
-      min-width: 0;
     }
-    .tab.active { color: var(--text); border-color: var(--accent); background: #1f3550; }
-    main { padding: 14px 12px 28px; max-width: 820px; margin: 0 auto; }
-    .summary {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 8px;
-      margin-bottom: 14px;
+    h2 {
+      border-top: 1px solid #ededed;
+      margin: 32px 0 14px;
+      padding-top: 24px;
+      font-size: 24px;
+      line-height: 1.25;
+      letter-spacing: 0;
     }
-    .metric {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 9px 8px;
+    h3 {
+      margin: 22px 0 8px;
+      font-size: 20px;
+      line-height: 1.3;
     }
-    .metric b { display: block; font-size: 18px; }
-    .metric span { color: var(--muted); font-size: 12px; }
-    .section-title {
-      margin: 16px 2px 8px;
-      color: var(--muted);
-      font-size: 13px;
-      font-weight: 750;
+    ul {
+      margin: 0 0 18px;
+      padding-left: 26px;
     }
-    .item {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 12px;
-      margin-bottom: 8px;
+    li {
+      margin: 0 0 12px;
+      overflow-wrap: anywhere;
     }
-    .item-title {
-      display: flex;
-      justify-content: space-between;
-      gap: 10px;
-      margin-bottom: 6px;
-      font-weight: 750;
+    .meta {
+      color: #777;
+      display: block;
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin-top: 2px;
     }
-    .badge {
-      flex: 0 0 auto;
-      color: var(--bg);
-      background: var(--accent);
-      border-radius: 999px;
-      padding: 2px 8px;
-      font-size: 12px;
-      font-weight: 800;
+    .memory {
+      margin: 0 0 18px;
+      overflow-wrap: anywhere;
     }
-    .meta { color: var(--muted); font-size: 13px; }
-    .content { margin-top: 8px; color: #dce7f0; overflow-wrap: anywhere; }
+    .memory-title {
+      display: block;
+      font-weight: 700;
+      margin-bottom: 3px;
+    }
     .empty {
-      border: 1px dashed var(--line);
-      border-radius: 8px;
-      color: var(--muted);
-      padding: 24px 14px;
-      text-align: center;
+      color: #888;
+      font-style: italic;
+      margin: 0 0 18px;
     }
-    @media (max-width: 430px) {
-      .tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    @media (max-width: 560px) {
+      main { padding-top: 28px; }
+      h1 { font-size: 30px; }
+      body { font-size: 17px; }
     }
   </style>
 </head>
 <body>
-  <header>
-    <h1>Web 清單</h1>
-    <nav class="tabs">
-      {% for key, label in tabs %}
-        <a class="tab {{ 'active' if tab == key else '' }}" href="?tab={{ key }}">{{ label }}</a>
-      {% endfor %}
-    </nav>
-  </header>
   <main>
-    <section class="summary">
-      <div class="metric"><b>{{ counts.reminders }}</b><span>提醒</span></div>
-      <div class="metric"><b>{{ counts.memories }}</b><span>記憶</span></div>
-      <div class="metric"><b>{{ counts.trackers }}</b><span>追蹤</span></div>
-      <div class="metric"><b>{{ counts.locations }}</b><span>地點</span></div>
+    <h1>清單紀錄</h1>
+    <div class="byline">GD牌提醒機器人 · {{ generated_at }}</div>
+    <nav class="toc">
+      <a href="#reminders">提醒 {{ counts.reminders }}</a>
+      <a href="#trackers">追蹤 {{ counts.trackers }}</a>
+      <a href="#memories">記憶 {{ counts.memories }}</a>
+      <a href="#locations">地點 {{ counts.locations }}</a>
+    </nav>
+
+    <section id="reminders">
+      <h2>提醒清單</h2>
+      {% if reminders %}
+        <ul>
+        {% for ev in reminders %}
+          <li>
+            {{ ev.title }}
+            <span class="meta">{{ ev.badge }} · {{ ev.time }}</span>
+          </li>
+        {% endfor %}
+        </ul>
+      {% else %}<p class="empty">目前沒有進行中的提醒。</p>{% endif %}
     </section>
 
-    {% if tab == "reminders" %}
-      {% if reminders %}
-        {% for ev in reminders %}
-          <article class="item">
-            <div class="item-title">
-              <span>{{ ev.title }}</span>
-              <span class="badge">{{ ev.badge }}</span>
-            </div>
-            <div class="meta">{{ ev.time }}</div>
-          </article>
-        {% endfor %}
-      {% else %}<div class="empty">目前沒有進行中的提醒。</div>{% endif %}
-    {% elif tab == "memories" %}
-      {% if memories %}
-        {% for mem in memories %}
-          <article class="item">
-            <div class="item-title"><span>🧠 {{ mem.keyword }}</span></div>
-            <div class="content">{{ mem.content|safe }}</div>
-          </article>
-        {% endfor %}
-      {% else %}<div class="empty">記憶庫是空的。</div>{% endif %}
-    {% elif tab == "trackers" %}
+    <section id="trackers">
+      <h2>追蹤清單</h2>
       {% if tracker_groups %}
         {% for group in tracker_groups %}
-          <div class="section-title">{{ group.label }}</div>
-          {% for item in group.items %}
-            <article class="item">
-              <div class="item-title">
-                <span>{{ item.name }}</span>
-                <span class="badge">{{ item.badge }}</span>
-              </div>
-              <div class="meta">{{ item.meta }}</div>
-              {% if item.notes %}<div class="content">{{ item.notes }}</div>{% endif %}
-            </article>
+          <h3>{{ group.label }}</h3>
+          <ul>
+          {% for item in group.entries %}
+            <li>
+              {{ item.name }}
+              <span class="meta">{{ item.meta }}</span>
+              {% if item.notes %}<span class="meta">{{ item.notes }}</span>{% endif %}
+            </li>
           {% endfor %}
+          </ul>
         {% endfor %}
-      {% else %}<div class="empty">追蹤清單是空的。</div>{% endif %}
-    {% elif tab == "locations" %}
+      {% else %}<p class="empty">追蹤清單是空的。</p>{% endif %}
+    </section>
+
+    <section id="memories">
+      <h2>記憶清單</h2>
+      {% if memories %}
+        {% for mem in memories %}
+          <p class="memory">
+            <span class="memory-title">{{ mem.keyword }}</span>
+            {{ mem.content|safe }}
+          </p>
+        {% endfor %}
+      {% else %}<p class="empty">記憶庫是空的。</p>{% endif %}
+    </section>
+
+    <section id="locations">
+      <h2>地點清單</h2>
       {% if locations %}
+        <ul>
         {% for loc in locations %}
-          <article class="item">
-            <div class="item-title"><span>📍 {{ loc.name }}</span></div>
-            <div class="meta">{{ "%.6f"|format(loc.latitude) }}, {{ "%.6f"|format(loc.longitude) }}</div>
-            {% if loc.address %}<div class="content">{{ loc.address }}</div>{% endif %}
-          </article>
+          <li>
+            {{ loc.name }}
+            <span class="meta">{{ "%.6f"|format(loc.latitude) }}, {{ "%.6f"|format(loc.longitude) }}</span>
+            {% if loc.address %}<span class="meta">{{ loc.address }}</span>{% endif %}
+          </li>
         {% endfor %}
-      {% else %}<div class="empty">目前沒有儲存地點。</div>{% endif %}
-    {% endif %}
+        </ul>
+      {% else %}<p class="empty">目前沒有儲存地點。</p>{% endif %}
+    </section>
   </main>
 </body>
 </html>
@@ -1986,20 +1970,11 @@ def _web_tracker_groups(user_id):
                 "notes": t.notes or "",
             })
         if items:
-            groups.append({"label": category_label.get(category, category), "items": items})
+            groups.append({"label": category_label.get(category, category), "entries": items})
     return groups
 
 @app.route("/web/lists/<user_id>", methods=["GET"])
 def web_lists(user_id):
-    tab = request.args.get("tab", "reminders")
-    tabs = [
-        ("reminders", "提醒"),
-        ("memories", "記憶"),
-        ("trackers", "追蹤"),
-        ("locations", "地點"),
-    ]
-    if tab not in {key for key, _ in tabs}:
-        tab = "reminders"
     reminders = _web_reminders(user_id)
     memories = _web_memories(user_id)
     tracker_groups = _web_tracker_groups(user_id)
@@ -2007,13 +1982,12 @@ def web_lists(user_id):
     counts = {
         "reminders": len(reminders),
         "memories": len(memories),
-        "trackers": sum(len(group["items"]) for group in tracker_groups),
+        "trackers": sum(len(group["entries"]) for group in tracker_groups),
         "locations": len(locations),
     }
     return render_template_string(
         WEB_LISTS_TEMPLATE,
-        tab=tab,
-        tabs=tabs,
+        generated_at=now_taipei().strftime("%Y/%m/%d %H:%M"),
         counts=counts,
         reminders=reminders,
         memories=memories,
