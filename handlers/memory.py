@@ -85,13 +85,21 @@ def memory_kb(mem_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+async def _reply(update: Update, text: str, **kwargs):
+    if update.message:
+        await update.message.reply_text(text, **kwargs)
+    elif update.callback_query and update.callback_query.message:
+        await update.callback_query.message.reply_text(text, **kwargs)
+
+
 async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     user_id = update.effective_user.id
 
     if text.startswith("記住"):
         parts = text[2:].strip().split(" ", 1)
         if len(parts) < 2:
-            await update.message.reply_text(
+            await _reply(
+                update,
                 "格式：<code>記住 [關鍵字] [內容]</code>\n"
                 "內容可用：<code>**粗體**</code>、<code>__斜體__</code>、"
                 "<code>~~刪除線~~</code>、<code>||防劇透||</code>、<code>`等寬`</code>",
@@ -106,30 +114,33 @@ async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: st
         exact = next((m for m in existing if m.keyword == keyword), None)
         if save_memory(user_id, keyword, stored_content):
             verb = "🔄 已更新" if exact else "🧠 已記住"
-            await update.message.reply_text(
+            await _reply(
+                update,
                 f"{verb}：<b>{html.escape(keyword)}</b>\n{content_html}",
                 parse_mode=ParseMode.HTML,
             )
         else:
-            await update.message.reply_text("❌ 儲存失敗。", parse_mode=ParseMode.HTML)
+            await _reply(update, "❌ 儲存失敗。", parse_mode=ParseMode.HTML)
 
     elif text.startswith("查詢"):
         keyword = text[2:].strip()
         if not keyword:
-            await update.message.reply_text("格式：<code>查詢 [關鍵字]</code>", parse_mode=ParseMode.HTML)
+            await _reply(update, "格式：<code>查詢 [關鍵字]</code>", parse_mode=ParseMode.HTML)
             return
         results = query_memory(user_id, keyword)
         if not results:
-            await update.message.reply_text(f"🔍 找不到「{html.escape(keyword)}」的記憶。", parse_mode=ParseMode.HTML)
+            await _reply(update, f"🔍 找不到「{html.escape(keyword)}」的記憶。", parse_mode=ParseMode.HTML)
         elif len(results) == 1:
-            await update.message.reply_text(
+            await _reply(
+                update,
                 memory_text(results[0].keyword, results[0].content),
                 parse_mode=ParseMode.HTML,
                 reply_markup=memory_kb(results[0].id),
             )
         else:
             buttons = [[InlineKeyboardButton(m.keyword, callback_data=f"mem:view:{m.id}")] for m in results]
-            await update.message.reply_text(
+            await _reply(
+                update,
                 f"🔍 找到 {len(results)} 筆關於「{html.escape(keyword)}」的記憶，請選擇：",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup(buttons),
@@ -138,18 +149,18 @@ async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: st
     elif text.startswith("忘記"):
         keyword = text[2:].strip()
         if forget_memory(user_id, keyword):
-            await update.message.reply_text(f"🗑️ 已忘記「{html.escape(keyword)}」。", parse_mode=ParseMode.HTML)
+            await _reply(update, f"🗑️ 已忘記「{html.escape(keyword)}」。", parse_mode=ParseMode.HTML)
         else:
-            await update.message.reply_text(f"❌ 找不到「{html.escape(keyword)}」。", parse_mode=ParseMode.HTML)
+            await _reply(update, f"❌ 找不到「{html.escape(keyword)}」。", parse_mode=ParseMode.HTML)
 
     elif text == "記憶清單":
         memories = list_memories(user_id)
         if not memories:
-            await update.message.reply_text("🧠 記憶庫是空的。", parse_mode=ParseMode.HTML)
+            await _reply(update, "🧠 記憶庫是空的。", parse_mode=ParseMode.HTML)
         else:
             valid = [m for m in memories if m.keyword and m.keyword.strip()]
             lines = ["🧠 <b>記憶清單</b>\n"] + [f"• {html.escape(m.keyword.strip())}" for m in valid]
-            await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+            await _reply(update, "\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def cb_mem_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mem_id: int):
