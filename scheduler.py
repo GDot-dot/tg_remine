@@ -310,20 +310,81 @@ def _weather_advice(description, rain, temp_max, comfort=None):
         return f"體感{comfort}。"
     return "天氣看起來穩定。"
 
+def _cwa_get(data, *keys):
+    if not isinstance(data, dict):
+        return None
+    for key in keys:
+        if key in data:
+            return data.get(key)
+    return None
+
+def _cwa_as_list(value):
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+def _cwa_locations(data):
+    records = _cwa_get(data, "records", "Records") or {}
+    locations = _cwa_get(records, "location", "Location")
+    if locations is not None:
+        return _cwa_as_list(locations)
+
+    groups = _cwa_get(records, "locations", "Locations") or []
+    result = []
+    for group in _cwa_as_list(groups):
+        result.extend(_cwa_as_list(_cwa_get(group, "location", "Location")))
+    return result
+
+def _cwa_scalar(value):
+    if value in (None, ""):
+        return None
+    if not isinstance(value, (dict, list)):
+        return value
+    return None
+
+def _cwa_element_value(element_value):
+    preferred_keys = (
+        "value", "Value", "parameterName", "ParameterName",
+        "Weather", "WeatherDescription",
+        "ProbabilityOfPrecipitation",
+        "Temperature", "MaxTemperature", "MinTemperature",
+        "ComfortIndexDescription", "ComfortIndex",
+    )
+    if isinstance(element_value, dict):
+        for key in preferred_keys:
+            scalar = _cwa_scalar(element_value.get(key))
+            if scalar is not None:
+                return str(scalar).strip()
+        for value in element_value.values():
+            scalar = _cwa_scalar(value)
+            if scalar is not None:
+                return str(scalar).strip()
+    else:
+        scalar = _cwa_scalar(element_value)
+        if scalar is not None:
+            return str(scalar).strip()
+    return None
+
 def _cwa_element_values(location, element_name):
-    elements = location.get("weatherElement") or []
-    element = next((e for e in elements if e.get("elementName") == element_name), None)
+    elements = _cwa_as_list(_cwa_get(location, "weatherElement", "WeatherElement"))
+    element = next(
+        (e for e in elements if _cwa_get(e, "elementName", "ElementName") == element_name),
+        None,
+    )
     if not element:
         return []
     values = []
-    for item in (element.get("time") or []):
-        parameter = item.get("parameter") or {}
-        if parameter.get("parameterName") is not None:
-            values.append(str(parameter.get("parameterName")).strip())
+    for item in _cwa_as_list(_cwa_get(element, "time", "Time")):
+        parameter = _cwa_get(item, "parameter", "Parameter") or {}
+        parameter_name = _cwa_get(parameter, "parameterName", "ParameterName")
+        if parameter_name is not None:
+            values.append(str(parameter_name).strip())
             continue
-        element_values = item.get("elementValue") or []
-        if element_values:
-            values.append(str((element_values[0] or {}).get("value", "")).strip())
+        for element_value in _cwa_as_list(_cwa_get(item, "elementValue", "ElementValue")):
+            value = _cwa_element_value(element_value)
+            if value is not None:
+                values.append(value)
+                break
     return values
 
 def _cwa_element_values_any(location, names):
@@ -359,14 +420,11 @@ def fetch_weather_summary(city):
                 },
                 timeout=8,
             ).json()
-            locations_groups = ((data.get("records") or {}).get("locations")) or []
-            locations = []
-            for group in locations_groups:
-                locations.extend(group.get("location") or [])
+            locations = _cwa_locations(data)
             if not locations:
                 return f"🌤 中央氣象署查不到「{city}」的鄉鎮市區預報，請確認格式如：新北市淡水區。"
             location = locations[0]
-            location_label = f"{county}{location.get('locationName') or district}"
+            location_label = f"{county}{_cwa_get(location, 'locationName', 'LocationName') or district}"
             wx = (_cwa_element_values_any(location, ["天氣現象", "Wx"]) or ["天氣資料"])[0]
             pops = [_to_int(v) for v in _cwa_element_values_any(location, ["12小時降雨機率", "降雨機率", "PoP12h", "PoP"])]
             temps = [_to_int(v) for v in _cwa_element_values_any(location, ["溫度", "平均溫度", "T"])]
@@ -384,7 +442,7 @@ def fetch_weather_summary(city):
                 },
                 timeout=8,
             ).json()
-            locations = (((data.get("records") or {}).get("location")) or [])
+            locations = _cwa_locations(data)
             if not locations:
                 return f"🌤 中央氣象署查不到「{city}」的縣市預報，請輸入例如：臺北市，或新北市淡水區。"
             location = locations[0]
