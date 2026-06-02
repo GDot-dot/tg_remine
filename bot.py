@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request
 
 import pytz
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters,
@@ -42,6 +42,7 @@ from handlers.tracker import (
     handle_tracker_toggle_notify, handle_tracker_edit_value,
     TRIGGER_MAP as TRACKER_TRIGGER_MAP,
 )
+from handlers.menu import REPLY_KB, cmd_hide_keyboard, send_main_menu
 from telegraph_pages import publish_telegraph_list_page
 
 logging.basicConfig(level=logging.INFO,
@@ -306,31 +307,15 @@ HELP_TEXT = """🤖 <b>Telegram 智慧管家</b>
 
 <b>通用</b>：<code>取消</code> — 中斷操作"""
 
-# 浮動快捷鍵盤（Reply Keyboard）
-_REPLY_KB = ReplyKeyboardMarkup(
-    [
-        ["📋 提醒清單", "🧠 記憶清單"],
-        ["📌 追蹤清單", "💳 每月支出"],
-        ["📍 地點清單", "🎨 貼圖轉換"],
-        ["📝 Telegraph 清單", "⌨️ 隱藏鍵盤"],
-        ["⚙️ 設定中心", "❓ 說明"],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
-)
-
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 歡迎使用 Telegram 智慧管家！\n\n{HELP_TEXT}",
         parse_mode=ParseMode.HTML,
-        reply_markup=_REPLY_KB,
+        reply_markup=REPLY_KB,
     )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reply(update, HELP_TEXT)
-
-async def cmd_hide_keyboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⌨️ 已隱藏快捷鍵盤。輸入 /start 可以重新顯示。", reply_markup=ReplyKeyboardRemove())
 
 async def send_web_lists_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     status = await update.message.reply_text("📝 正在產生 Telegraph 清單...")
@@ -1489,11 +1474,14 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
     # 固定指令路由
+    if text in ("功能選單", "☰ 功能選單", "主選單", "選單", "menu"):
+        await send_main_menu(update, ctx)
+        return
     if text in ("隱藏鍵盤", "⌨️ 隱藏鍵盤", "收起鍵盤", "關閉鍵盤"):
         await cmd_hide_keyboard(update, ctx)
         return
     if text in ("顯示鍵盤", "快捷鍵盤"):
-        await update.message.reply_text("⌨️ 已顯示快捷鍵盤。", reply_markup=_REPLY_KB)
+        await update.message.reply_text("⌨️ 已顯示快捷鍵盤。", reply_markup=REPLY_KB)
         return
     if text in ("Telegraph 清單", "📝 Telegraph 清單", "Web 清單", "🌐 Web 清單", "網頁清單"):
         await send_web_lists_link(update, ctx)
@@ -1614,6 +1602,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             cmd = parts[1]
             if cmd == "提醒清單":
                 await handle_reminder_list(update, ctx)
+            elif cmd == "追蹤清單":
+                await handle_tracker_list(update, ctx, "追蹤清單")
+            elif cmd == "每月支出":
+                await handle_monthly_cost(update, ctx)
             elif cmd == "記憶清單":
                 await handle_memory(update, ctx, "記憶清單")
             elif cmd == "地點清單":

@@ -62,6 +62,9 @@ class UserSetting(Base):
     snooze_buttons            = Column(String(50), default="5,30,60")
     last_morning_summary_date = Column(Date, nullable=True)
     last_evening_summary_date = Column(Date, nullable=True)
+    telegraph_path            = Column(String(255), nullable=True)
+    telegraph_url             = Column(String(255), nullable=True)
+    telegraph_access_token    = Column(String(255), nullable=True)
 
 class Tracker(Base):
     __tablename__ = "trackers"
@@ -85,8 +88,38 @@ class Tracker(Base):
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    _ensure_user_setting_columns()
     _ensure_tracker_columns()
     logger.info("✅ DB tables created/verified.")
+
+def _ensure_user_setting_columns():
+    try:
+        inspector = inspect(engine)
+        if "user_settings" not in inspector.get_table_names():
+            return
+        columns = {c["name"] for c in inspector.get_columns("user_settings")}
+        dialect = engine.dialect.name
+        statements = []
+        wanted = {
+            "telegraph_path": "VARCHAR(255)",
+            "telegraph_url": "VARCHAR(255)",
+            "telegraph_access_token": "VARCHAR(255)",
+        }
+        for column, column_type in wanted.items():
+            if column in columns:
+                continue
+            if dialect == "postgresql":
+                statements.append(f"ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS {column} {column_type}")
+            else:
+                statements.append(f"ALTER TABLE user_settings ADD COLUMN {column} {column_type}")
+        if not statements:
+            return
+        with engine.begin() as conn:
+            for statement in statements:
+                conn.execute(sql_text(statement))
+        logger.info("✅ User setting columns migrated/verified.")
+    except Exception as e:
+        logger.error(f"ensure user setting columns: {e}", exc_info=True)
 
 def _ensure_tracker_columns():
     try:
@@ -219,6 +252,7 @@ def update_user_setting(user_id, **fields):
         "city", "weather_enabled", "morning_summary_enabled", "evening_summary_enabled",
         "morning_summary_time", "evening_summary_time", "snooze_buttons",
         "last_morning_summary_date", "last_evening_summary_date",
+        "telegraph_path", "telegraph_url", "telegraph_access_token",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:

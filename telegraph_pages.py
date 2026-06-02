@@ -7,7 +7,10 @@ from datetime import datetime
 import pytz
 import requests
 
-from db import get_locations, get_trackers, get_user_events, list_memories
+from db import (
+    get_locations, get_trackers, get_user_events, get_user_setting,
+    list_memories, update_user_setting,
+)
 
 TAIPEI_TZ = pytz.timezone("Asia/Taipei")
 TELEGRAPH_ACCESS_TOKEN = os.environ.get("TELEGRAPH_ACCESS_TOKEN", "")
@@ -170,9 +173,11 @@ def _location_nodes(locations):
     ])]
 
 
-def _get_access_token():
+def _get_access_token(user_id, setting):
     if TELEGRAPH_ACCESS_TOKEN:
         return TELEGRAPH_ACCESS_TOKEN
+    if getattr(setting, "telegraph_access_token", None):
+        return setting.telegraph_access_token
     response = requests.post(
         f"{TELEGRAPH_API}/createAccount",
         data={"short_name": "tg_remine", "author_name": TELEGRAPH_AUTHOR_NAME},
@@ -181,10 +186,21 @@ def _get_access_token():
     data = response.json()
     if not data.get("ok"):
         raise RuntimeError(data.get("error", "Telegraph createAccount failed"))
-    return data["result"]["access_token"]
+    access_token = data["result"]["access_token"]
+    update_user_setting(user_id, telegraph_access_token=access_token)
+    return access_token
+
+
+def _telegraph_request(method, payload):
+    response = requests.post(f"{TELEGRAPH_API}/{method}", data=payload, timeout=15)
+    data = response.json()
+    if not data.get("ok"):
+        raise RuntimeError(data.get("error", f"Telegraph {method} failed"))
+    return data["result"]
 
 
 def publish_telegraph_list_page(user_id):
+    setting = get_user_setting(user_id)
     reminders = [
         ev for ev in get_user_events(str(user_id))
         if ev.is_recurring or (not ev.reminder_sent and ev.reminder_time is not None)
@@ -208,18 +224,25 @@ def publish_telegraph_list_page(user_id):
         *_location_nodes(locations),
     ]
 
-    response = requests.post(
-        f"{TELEGRAPH_API}/createPage",
-        data={
-            "access_token": _get_access_token(),
-            "title": "清單紀錄",
-            "author_name": TELEGRAPH_AUTHOR_NAME,
-            "content": json.dumps(content, ensure_ascii=False),
-            "return_content": "false",
-        },
-        timeout=15,
-    )
-    data = response.json()
-    if not data.get("ok"):
-        raise RuntimeError(data.get("error", "Telegraph createPage failed"))
-    return data["result"]["url"]
+    access_token = _get_access_token(user_id, setting)
+    content_json = json.dumps(content, ensure_ascii=False)
+    common_payload = {
+        "access_token": access_token,
+        "title": "清單紀錄",
+        "author_name": TELEGRAPH_AUTHOR_NAME,
+        "content": content_json,
+        "return_content": "false",
+    }
+
+    path = getattr(setting, "telegraph_path", None)
+    if path:
+        try:
+            page = _telegraph_request("editPage", {"path": path, **common_payload})
+            update_user_setting(user_id, telegraph_path=page.get("path"), telegraph_url=page.get("url"))
+            return page["url"]
+        except RuntimeError:
+            update_user_setting(user_id, telegraph_path=None, telegraph_url=None)
+
+    page = _telegraph_request("createPage", common_payload)
+    update_user_setting(user_id, telegraph_path=page.get("path"), telegraph_url=page.get("url"))
+    return page["url"]
