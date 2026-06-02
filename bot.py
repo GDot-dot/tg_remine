@@ -24,8 +24,6 @@ from db import (
     init_db,
     add_event, get_event, get_user_events,
     update_event_content, update_event_fields, delete_event_by_id,
-    save_memory, query_memory, get_memory_by_id, update_memory_by_id,
-    delete_memory_by_id, forget_memory, list_memories,
 )
 from scheduler import (
     scheduler, safe_start, safe_add_job, safe_add_cron,
@@ -44,6 +42,10 @@ from handlers.locations import (
     handle_location_list, handle_location_msg, handle_location_state,
 )
 from handlers.menu import REPLY_KB, cmd_hide_keyboard, send_main_menu
+from handlers.memory import (
+    cb_mem_delete_ok, cb_mem_delete_prompt, cb_mem_edit_prompt, cb_mem_view,
+    handle_memory, handle_memory_edit_state,
+)
 from handlers.settings import (
     cmd_settings, handle_settings_callback, handle_settings_state,
     show_settings,
@@ -833,199 +835,6 @@ async def _finish_recurring(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         f"✅ 週期提醒已設定！\n\n📆 每{'、'.join(day_names)} {time_str}\n📝 {content}")
 
 
-# ── 記憶庫（對齊 LINE：多筆結果用按鈕選擇）──────────────────────────────────
-
-MEMORY_HTML_PREFIX = "__TG_MEMORY_HTML__\n"
-
-
-def format_memory_content(content: str) -> str:
-    """
-    將記憶內容轉成 Telegram HTML。
-    先 escape 使用者輸入，再支援常用捷徑：
-    **粗體**、__斜體__、~~刪除線~~、||防劇透||、`等寬`。
-    """
-    placeholders: list[tuple[str, str]] = []
-
-    def stash(pattern: str, repl):
-        nonlocal content
-        def _replace(m):
-            token = f"\u0000MEMFMT{len(placeholders)}\u0000"
-            placeholders.append((token, repl(m)))
-            return token
-        content = re.sub(pattern, _replace, content, flags=re.S)
-
-    stash(r"```(.+?)```", lambda m: f"<pre>{html.escape(m.group(1).strip())}</pre>")
-    stash(r"`([^`\n]+?)`", lambda m: f"<code>{html.escape(m.group(1))}</code>")
-    escaped = html.escape(content)
-    rules = [
-        (r"\*\*(.+?)\*\*", r"<b>\1</b>"),
-        (r"__(.+?)__", r"<i>\1</i>"),
-        (r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>"),
-        (r"(?<!_)_([^_\n]+?)_(?!_)", r"<i>\1</i>"),
-        (r"~~(.+?)~~", r"<s>\1</s>"),
-        (r"\|\|(.+?)\|\|", r"<tg-spoiler>\1</tg-spoiler>"),
-    ]
-    for pattern, replacement in rules:
-        escaped = re.sub(pattern, replacement, escaped, flags=re.S)
-    for token, value in placeholders:
-        escaped = escaped.replace(html.escape(token), value)
-    return escaped
-
-
-def stored_memory_content(content: str) -> str:
-    if content.startswith(MEMORY_HTML_PREFIX):
-        return content[len(MEMORY_HTML_PREFIX):]
-    return format_memory_content(content)
-
-
-def extract_message_html(update: Update, plain_content: str, prefix: str = "") -> str:
-    """
-    Telegram 原生格式會放在 message entities 裡；text_html 可保留這些格式。
-    若使用者只是手打 **粗體** / ||防劇透||，則走本地格式轉換。
-    """
-    msg = update.message
-    if not msg:
-        return format_memory_content(plain_content)
-
-    html_text = getattr(msg, "text_html", None)
-    if html_text and msg.entities and (not prefix or html_text.startswith(prefix)):
-        return html_text[len(prefix):]
-
-    return format_memory_content(plain_content)
-
-
-def extract_memory_content_html(update: Update, keyword: str, plain_content: str) -> str:
-    return extract_message_html(update, plain_content, f"記住 {keyword} ")
-
-
-def memory_text(keyword: str, content: str) -> str:
-    return f"🧠 <b>{html.escape(keyword)}</b>\n{stored_memory_content(content)}"
-
-
-def memory_kb(mem_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✏️ 編輯", callback_data=f"mem:edit:{mem_id}"),
-            InlineKeyboardButton("🗑️ 刪除", callback_data=f"mem:del:{mem_id}"),
-        ],
-    ])
-
-
-async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
-    user_id = update.effective_user.id
-
-    if text.startswith("記住"):
-        parts = text[2:].strip().split(" ", 1)
-        if len(parts) < 2:
-            await reply(update,
-                "格式：<code>記住 [關鍵字] [內容]</code>\n"
-                "內容可用：<code>**粗體**</code>、<code>__斜體__</code>、"
-                "<code>~~刪除線~~</code>、<code>||防劇透||</code>、<code>`等寬`</code>")
-            return
-        kw, content = parts
-        kw = kw.strip().replace("\n", "").replace("\r", "")  # 防止換行污染清單
-        content_html = extract_memory_content_html(update, kw, content)
-        stored_content = MEMORY_HTML_PREFIX + content_html
-        existing = query_memory(user_id, kw)
-        # 找完全匹配的（query_memory 用 ilike 模糊，這裡再精確比對）
-        exact = next((m for m in existing if m.keyword == kw), None)
-        if save_memory(user_id, kw, stored_content):
-            if exact:
-                await reply(update, f"🔄 已更新：<b>{html.escape(kw)}</b>\n{content_html}")
-            else:
-                await reply(update, f"🧠 已記住：<b>{html.escape(kw)}</b>\n{content_html}")
-        else:
-            await reply(update, "❌ 儲存失敗。")
-
-    elif text.startswith("查詢"):
-        kw      = text[2:].strip()
-        if not kw:
-            await reply(update, "格式：<code>查詢 [關鍵字]</code>")
-            return
-        results = query_memory(user_id, kw)
-        if not results:
-            await reply(update, f"🔍 找不到「{html.escape(kw)}」的記憶。")
-        elif len(results) == 1:
-            await reply(update, memory_text(results[0].keyword, results[0].content), memory_kb(results[0].id))
-        else:
-            # 多筆 → 按鈕選擇（對齊 LINE QuickReply 邏輯）
-            btns = [[InlineKeyboardButton(m.keyword, callback_data=f"mem:view:{m.id}")]
-                    for m in results]
-            await reply(update,
-                f"🔍 找到 {len(results)} 筆關於「{html.escape(kw)}」的記憶，請選擇：",
-                InlineKeyboardMarkup(btns))
-
-    elif text.startswith("忘記"):
-        kw = text[2:].strip()
-        if forget_memory(user_id, kw):
-            await reply(update, f"🗑️ 已忘記「{html.escape(kw)}」。")
-        else:
-            await reply(update, f"❌ 找不到「{html.escape(kw)}」。")
-
-    elif text == "記憶清單":
-        mems = list_memories(user_id)
-        if not mems:
-            await reply(update, "🧠 記憶庫是空的。")
-        else:
-            valid = [m for m in mems if m.keyword and m.keyword.strip()]
-            lines = ["🧠 <b>記憶清單</b>\n"] + [f"• {html.escape(m.keyword.strip())}" for m in valid]
-            await reply(update, "\n".join(lines))
-
-async def cb_mem_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mem_id: int):
-    q = update.callback_query
-    await q.answer()
-    from db import SessionLocal, Memory as MemModel
-    db  = SessionLocal()
-    mem = db.query(MemModel).filter(MemModel.id == mem_id).first()
-    db.close()
-    if mem:
-        await q.edit_message_text(memory_text(mem.keyword, mem.content),
-                                   parse_mode=ParseMode.HTML,
-                                   reply_markup=memory_kb(mem.id))
-    else:
-        await q.edit_message_text("❌ 找不到。")
-
-
-async def cb_mem_edit_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mem_id: int):
-    q = update.callback_query
-    await q.answer()
-    mem = get_memory_by_id(update.effective_user.id, mem_id)
-    if not mem:
-        await q.edit_message_text("❌ 找不到這筆記憶。")
-        return
-    user_states[update.effective_user.id] = {
-        "action": "edit_memory_content",
-        "memory_id": mem_id,
-        "keyword": mem.keyword,
-    }
-    await q.edit_message_text(
-        f"✏️ 請輸入「{html.escape(mem.keyword)}」的新內容：\n"
-        f"{stored_memory_content(mem.content)}",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def cb_mem_delete_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mem_id: int):
-    q = update.callback_query
-    await q.answer()
-    mem = get_memory_by_id(update.effective_user.id, mem_id)
-    if not mem:
-        await q.edit_message_text("❌ 找不到這筆記憶。")
-        return
-    await q.edit_message_text(
-        f"⚠️ 確定要刪除記憶「{html.escape(mem.keyword)}」？",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb([("✅ 確認刪除", f"mem:delok:{mem_id}"), ("❌ 取消", "cancel")]),
-    )
-
-
-async def cb_mem_delete_ok(update: Update, ctx: ContextTypes.DEFAULT_TYPE, mem_id: int):
-    q = update.callback_query
-    await q.answer()
-    ok = delete_memory_by_id(update.effective_user.id, mem_id)
-    await q.edit_message_text("🗑️ 已刪除記憶。" if ok else "❌ 找不到這筆記憶。")
-
-
 async def run_sticker_queue(user_id: int):
     queue = sticker_queues.setdefault(user_id, deque())
     try:
@@ -1236,13 +1045,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         elif action == "edit_memory_content":
-            state = user_states.pop(user_id)
-            content_html = extract_message_html(update, text.strip())
-            stored_content = MEMORY_HTML_PREFIX + content_html
-            if update_memory_by_id(user_id, state["memory_id"], stored_content):
-                await reply(update, f"✅ 已更新記憶：<b>{html.escape(state['keyword'])}</b>\n{content_html}")
-            else:
-                await reply(update, "❌ 更新失敗，找不到這筆記憶。")
+            await handle_memory_edit_state(update, ctx, user_states, text)
             return
 
     # 固定指令路由
@@ -1450,8 +1253,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # ── 記憶庫
         elif parts[0] == "mem":
             if parts[1] == "view": await cb_mem_view(update, ctx, int(parts[2]))
-            elif parts[1] == "edit": await cb_mem_edit_prompt(update, ctx, int(parts[2]))
-            elif parts[1] == "del": await cb_mem_delete_prompt(update, ctx, int(parts[2]))
+            elif parts[1] == "edit": await cb_mem_edit_prompt(update, ctx, user_states, int(parts[2]))
+            elif parts[1] == "del": await cb_mem_delete_prompt(update, ctx, int(parts[2]), kb)
             elif parts[1] == "delok": await cb_mem_delete_ok(update, ctx, int(parts[2]))
 
         else:
