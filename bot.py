@@ -23,7 +23,6 @@ from telegram.constants import ParseMode
 from db import (
     init_db,
     add_event, get_event, get_user_events,
-    mark_reminder_sent, update_reminder_time,
     update_event_content, update_event_fields, delete_event_by_id,
     add_location, get_locations, get_location_by_name, delete_location,
     save_memory, query_memory, get_memory_by_id, update_memory_by_id,
@@ -416,7 +415,7 @@ async def cb_set_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         await q.edit_message_text("⚠️ 提醒時間已過，無法設定。")
         return
 
-    update_reminder_time(event_id, reminder_dt)
+    update_event_fields(event_id, reminder_time=reminder_dt, reminder_sent=0)
     safe_add_job(send_reminder, reminder_dt, [event_id], f"reminder_{event_id}")
 
     early_txt = f"（{[l for l,m in EARLY_OPTIONS if m==minutes][0]}）" if minutes > 0 else "（準時）"
@@ -1245,7 +1244,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await reply(update, "❌ 時間必須在現在之後。")
                 user_states[user_id] = {"action": "edit_reminder_time", "event_id": event_id}
                 return
-            update_reminder_time(event_id, new_dt)
+            update_event_fields(event_id, reminder_time=new_dt, reminder_sent=0)
             safe_add_job(send_reminder, new_dt, [event_id], f"reminder_{event_id}")
             await reply(update, f"✅ 已更新提醒時間：{new_dt.strftime('%Y/%m/%d %H:%M')}")
             return

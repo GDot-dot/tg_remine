@@ -1,15 +1,17 @@
 # scheduler.py
-import os, logging, threading, html
+import os, logging, threading, html, time
 from datetime import datetime, timedelta
 import requests, pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.executors.pool import ThreadPoolExecutor
-from db import DATABASE_URL, SessionLocal, Event, mark_reminder_sent, delete_event_by_id, decrease_remaining_repeats, update_reminder_time
+from db import DATABASE_URL, SessionLocal, Event, mark_reminder_sent, decrease_remaining_repeats, update_event_fields
 
 logger = logging.getLogger(__name__)
 TAIPEI_TZ = pytz.timezone("Asia/Taipei")
 TG_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TG_RETRY_DELAYS = (1, 3, 5)
+REMINDER_RETRY_DELAY = 5
 
 PRIORITY_RULES = {
     1: {"icon": "🟢", "interval": 30, "repeats": 3},
@@ -25,15 +27,62 @@ scheduler = BackgroundScheduler(jobstores=jobstores, executors=executors, job_de
 
 def _tg(method, **kwargs):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/{method}"
-    try:
-        return requests.post(url, json=kwargs, timeout=10).json()
-    except Exception as e:
-        logger.error(f"TG API ({method}): {e}"); return {}
+    last_error = None
+    for attempt, delay in enumerate(TG_RETRY_DELAYS, start=1):
+        try:
+            response = requests.post(url, json=kwargs, timeout=10)
+            data = response.json()
+            if data.get("ok"):
+                return data
+            error_code = data.get("error_code", response.status_code)
+            description = data.get("description", "")
+            retryable = response.status_code >= 500 or error_code == 429
+            logger.warning(
+                "TG API %s failed attempt %s/%s: %s %s",
+                method, attempt, len(TG_RETRY_DELAYS), error_code, description,
+            )
+            if not retryable:
+                return data
+            last_error = data
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "TG API %s error attempt %s/%s: %s",
+                method, attempt, len(TG_RETRY_DELAYS), e,
+            )
+        if attempt < len(TG_RETRY_DELAYS):
+            time.sleep(delay)
+    logger.error(f"TG API ({method}) exhausted retries: {last_error}")
+    return {}
 
 def tg_send(chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup: payload["reply_markup"] = reply_markup
-    return _tg("sendMessage", **payload)
+    result = _tg("sendMessage", **payload)
+    return bool(result.get("ok")), result
+
+def _is_retryable_tg_result(result):
+    if not result:
+        return True
+    error_code = result.get("error_code")
+    return error_code == 429 or (isinstance(error_code, int) and error_code >= 500)
+
+def _retry_reminder(event_id, reason):
+    retry_at = datetime.now(TAIPEI_TZ) + timedelta(minutes=REMINDER_RETRY_DELAY)
+    update_event_fields(event_id, reminder_time=retry_at, reminder_sent=0)
+    safe_add_job(send_reminder, retry_at, [event_id], f"reminder_{event_id}")
+    logger.warning(
+        "Reminder %s send failed; retry scheduled at %s. reason=%s",
+        event_id, retry_at.isoformat(), reason,
+    )
+
+def _finish_failed_reminder(db, event, reason):
+    logger.error("Reminder %s failed permanently: %s", event.id, reason)
+    mark_reminder_sent(event.id)
+    _remove_job(event.id)
+    if event.priority_level > 0:
+        db.query(Event).filter(Event.id == event.id).delete()
+        db.commit()
 
 def _confirm_kb(event_id):
     return {"inline_keyboard": [
@@ -59,16 +108,29 @@ def send_reminder(event_id):
         name    = event.target_display_name or "您"
         content = event.event_content
 
+        sent = False
+        send_result = {}
+
         if event.priority_level > 0:
             icon = PRIORITY_RULES[event.priority_level]["icon"]
-            tg_send(chat_id, f"{icon} <b>重要提醒！</b>\n\n@{name}\n記得要「{content}」！\n(未確認將繼續提醒)", _priority_kb(event_id))
+            sent, send_result = tg_send(chat_id, f"{icon} <b>重要提醒！</b>\n\n@{name}\n記得要「{content}」！\n(未確認將繼續提醒)", _priority_kb(event_id))
         elif event.is_recurring:
-            tg_send(chat_id, f"⏰ 週期提醒\n\n@{name}\n記得要「{content}」喔！", _confirm_kb(event_id))
+            sent, send_result = tg_send(chat_id, f"⏰ 週期提醒\n\n@{name}\n記得要「{content}」喔！", _confirm_kb(event_id))
         else:
             event_dt  = event.event_datetime.astimezone(TAIPEI_TZ)
-            tg_send(chat_id,
+            sent, send_result = tg_send(chat_id,
                 f"⏰ 提醒時間到！\n\n@{name}\n📅 {event_dt.strftime('%Y/%m/%d %H:%M')}\n📝 {content}",
                 _confirm_kb(event_id))
+
+        if not sent:
+            if not event.is_recurring:
+                if _is_retryable_tg_result(send_result):
+                    _retry_reminder(event_id, send_result)
+                else:
+                    _finish_failed_reminder(db, event, send_result)
+            else:
+                logger.warning("Recurring reminder %s send failed: %s", event_id, send_result)
+            return
 
         if not event.is_recurring:
             if event.priority_level > 0 and event.remaining_repeats > 0:
@@ -125,9 +187,13 @@ def restore_jobs():
     try:
         now = datetime.now(TAIPEI_TZ)
         recurring  = db.query(Event).filter(Event.is_recurring == 1).all()
-        future_one = db.query(Event).filter(Event.reminder_sent == 0, Event.is_recurring == 0, Event.reminder_time > now).all()
+        pending_one = db.query(Event).filter(
+            Event.reminder_sent == 0,
+            Event.is_recurring == 0,
+            Event.reminder_time.isnot(None),
+        ).all()
         count = 0
-        for ev in recurring + future_one:
+        for ev in recurring + pending_one:
             is_rec = ev.is_recurring
             job_id = f"{'recurring' if is_rec else 'reminder'}_{ev.id}"
             if scheduler.get_job(job_id): continue
@@ -137,7 +203,11 @@ def restore_jobs():
                     h, m = map(int, t.split(":"))
                     safe_add_cron(send_reminder, [ev.id], job_id, days.lower(), h, m)
                 else:
-                    safe_add_job(send_reminder, ev.reminder_time.astimezone(TAIPEI_TZ), [ev.id], job_id)
+                    run_at = ev.reminder_time.astimezone(TAIPEI_TZ)
+                    if run_at <= now:
+                        run_at = now + timedelta(seconds=10)
+                        logger.warning("Restoring missed reminder %s for immediate retry.", ev.id)
+                    safe_add_job(send_reminder, run_at, [ev.id], job_id)
                 count += 1
             except Exception as e:
                 logger.error(f"restore event {ev.id}: {e}")
