@@ -6,6 +6,7 @@ from collections import deque
 import requests
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from sticker_converter import convert_and_upload
@@ -25,6 +26,14 @@ async def _reply(update: Update, text: str):
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
     elif update.callback_query and update.callback_query.message:
         await update.callback_query.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def _safe_edit_text(message, text: str):
+    try:
+        await message.edit_text(text)
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            raise
 
 
 async def handle_sticker_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -48,16 +57,16 @@ async def run_sticker_queue(user_id: int):
         while queue:
             bot, chat_id, line_url, status = queue.popleft()
             try:
-                await status.edit_text("🔍 正在抓取 LINE 網頁資料...")
+                await _safe_edit_text(status, "🔍 正在抓取 LINE 網頁資料...")
                 link = await convert_and_upload(bot, user_id, chat_id, line_url, status)
                 if link:
-                    await status.edit_text(f"🎉 轉換完成！\n👉 {link}")
+                    await _safe_edit_text(status, f"🎉 轉換完成！\n👉 {link}")
                 else:
-                    await status.edit_text("❌ 找不到貼圖資料，請確認網址是否正確。")
+                    await _safe_edit_text(status, "❌ 找不到貼圖資料，請確認網址是否正確。")
             except Exception as e:
                 logger.error("sticker convert: %s", e, exc_info=True)
                 try:
-                    await status.edit_text(f"❌ 發生錯誤：{e}")
+                    await _safe_edit_text(status, f"❌ 發生錯誤：{e}")
                 except Exception:
                     pass
     finally:
