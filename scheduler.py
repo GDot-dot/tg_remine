@@ -315,10 +315,23 @@ def _cwa_element_values(location, element_name):
     element = next((e for e in elements if e.get("elementName") == element_name), None)
     if not element:
         return []
-    return [
-        ((item.get("parameter") or {}).get("parameterName") or "").strip()
-        for item in (element.get("time") or [])
-    ]
+    values = []
+    for item in (element.get("time") or []):
+        parameter = item.get("parameter") or {}
+        if parameter.get("parameterName") is not None:
+            values.append(str(parameter.get("parameterName")).strip())
+            continue
+        element_values = item.get("elementValue") or []
+        if element_values:
+            values.append(str((element_values[0] or {}).get("value", "")).strip())
+    return values
+
+def _cwa_element_values_any(location, names):
+    for name in names:
+        values = _cwa_element_values(location, name)
+        if values:
+            return values
+    return []
 
 def _to_int(value):
     try:
@@ -331,35 +344,68 @@ def fetch_weather_summary(city):
         return None
     if not CWA_AUTHORIZATION:
         return "🌤 尚未設定中央氣象署 CWA 授權碼，無法取得天氣。"
-    location_name = _normalize_cwa_city(city)
+    county, district = _parse_cwa_location(city)
     try:
-        data = requests.get(
-            "https://opendata.cwa.gov.tw/api/v1/rest/datastore/F-C0032-001",
-            params={
-                "Authorization": CWA_AUTHORIZATION,
-                "format": "JSON",
-                "locationName": location_name,
-            },
-            timeout=8,
-        ).json()
-        locations = (((data.get("records") or {}).get("location")) or [])
-        if not locations:
-            return f"🌤 中央氣象署查不到「{city}」的縣市預報，請改用縣市名稱，例如：臺北市、高雄市。"
-        location = locations[0]
-        wx = (_cwa_element_values(location, "Wx") or ["天氣資料"])[0]
-        pops = [_to_int(v) for v in _cwa_element_values(location, "PoP")]
-        min_ts = [_to_int(v) for v in _cwa_element_values(location, "MinT")]
-        max_ts = [_to_int(v) for v in _cwa_element_values(location, "MaxT")]
-        comfort = (_cwa_element_values(location, "CI") or [None])[0]
+        if district:
+            dataset_id = CWA_COUNTY_DATASET_IDS.get(county)
+            if not dataset_id:
+                return f"🌤 中央氣象署查不到「{city}」的縣市資料，請輸入例如：新北市淡水區。"
+            data = requests.get(
+                f"https://opendata.cwa.gov.tw/api/v1/rest/datastore/{dataset_id}",
+                params={
+                    "Authorization": CWA_AUTHORIZATION,
+                    "format": "JSON",
+                    "locationName": district,
+                },
+                timeout=8,
+            ).json()
+            locations_groups = ((data.get("records") or {}).get("locations")) or []
+            locations = []
+            for group in locations_groups:
+                locations.extend(group.get("location") or [])
+            if not locations:
+                return f"🌤 中央氣象署查不到「{city}」的鄉鎮市區預報，請確認格式如：新北市淡水區。"
+            location = locations[0]
+            location_label = f"{county}{location.get('locationName') or district}"
+            wx = (_cwa_element_values_any(location, ["天氣現象", "Wx"]) or ["天氣資料"])[0]
+            pops = [_to_int(v) for v in _cwa_element_values_any(location, ["12小時降雨機率", "降雨機率", "PoP12h", "PoP"])]
+            temps = [_to_int(v) for v in _cwa_element_values_any(location, ["溫度", "平均溫度", "T"])]
+            min_ts = [_to_int(v) for v in _cwa_element_values_any(location, ["最低溫度", "MinT"])]
+            max_ts = [_to_int(v) for v in _cwa_element_values_any(location, ["最高溫度", "MaxT"])]
+            comfort = (_cwa_element_values_any(location, ["舒適度指數", "舒適度", "CI"]) or [None])[0]
+        else:
+            location_name = county
+            data = requests.get(
+                "https://opendata.cwa.gov.tw/api/v1/rest/datastore/F-C0032-001",
+                params={
+                    "Authorization": CWA_AUTHORIZATION,
+                    "format": "JSON",
+                    "locationName": location_name,
+                },
+                timeout=8,
+            ).json()
+            locations = (((data.get("records") or {}).get("location")) or [])
+            if not locations:
+                return f"🌤 中央氣象署查不到「{city}」的縣市預報，請輸入例如：臺北市，或新北市淡水區。"
+            location = locations[0]
+            location_label = location_name
+            wx = (_cwa_element_values(location, "Wx") or ["天氣資料"])[0]
+            pops = [_to_int(v) for v in _cwa_element_values(location, "PoP")]
+            min_ts = [_to_int(v) for v in _cwa_element_values(location, "MinT")]
+            max_ts = [_to_int(v) for v in _cwa_element_values(location, "MaxT")]
+            temps = []
+            comfort = (_cwa_element_values(location, "CI") or [None])[0]
+
         rain_values = [v for v in pops if v is not None]
         min_values = [v for v in min_ts if v is not None]
         max_values = [v for v in max_ts if v is not None]
+        temp_values = [v for v in temps if v is not None]
         rain = max(rain_values) if rain_values else None
-        temp_min = min(min_values) if min_values else None
-        temp_max = max(max_values) if max_values else None
+        temp_min = min(min_values or temp_values) if (min_values or temp_values) else None
+        temp_max = max(max_values or temp_values) if (max_values or temp_values) else None
         temp = f"{temp_min}-{temp_max}°C" if temp_min is not None and temp_max is not None else "溫度未知"
         rain_text = f"降雨機率 {rain}%" if rain is not None else "降雨機率未知"
-        return f"🌤 {location_name}今日天氣：{wx}，{temp}，{rain_text}。{_weather_advice(wx, rain, temp_max, comfort)}"
+        return f"🌤 {location_label}今日天氣：{wx}，{temp}，{rain_text}。{_weather_advice(wx, rain, temp_max, comfort)}"
     except Exception as e:
         logger.warning("fetch CWA weather failed for %s: %s", city, e)
         return "🌤 中央氣象署天氣資料暫時讀取失敗。"
