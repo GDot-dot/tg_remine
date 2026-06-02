@@ -424,7 +424,7 @@ async def handle_settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYP
 
     if action == "city":
         user_states[user_id] = {"action": "setting_city"}
-        await q.edit_message_text("📍 請輸入台灣縣市，例如：台北、高雄、臺中市、宜蘭縣")
+        await q.edit_message_text("📍 請輸入台灣縣市或鄉鎮市區，例如：台北、新北市淡水區、臺中市、宜蘭縣")
         return
     if action == "morning_time":
         user_states[user_id] = {"action": "setting_morning_time"}
