@@ -1,5 +1,5 @@
 # scheduler.py
-import os, logging, threading, html, time
+import os, logging, threading, html, time, re
 from datetime import datetime, timedelta
 import requests, pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -366,6 +366,7 @@ def _cwa_scalar(value):
 def _cwa_element_value(element_value):
     preferred_keys = (
         "value", "Value", "parameterName", "ParameterName",
+        "PoP", "PoP12h", "PoP6h",
         "Weather", "WeatherDescription",
         "ProbabilityOfPrecipitation",
         "Temperature", "MaxTemperature", "MinTemperature",
@@ -388,8 +389,12 @@ def _cwa_element_value(element_value):
 
 def _cwa_element_values(location, element_name):
     elements = _cwa_as_list(_cwa_get(location, "weatherElement", "WeatherElement"))
+    normalized_element_name = _normalize_cwa_name(element_name)
     element = next(
-        (e for e in elements if _cwa_get(e, "elementName", "ElementName") == element_name),
+        (
+            e for e in elements
+            if _normalize_cwa_name(_cwa_get(e, "elementName", "ElementName")) == normalized_element_name
+        ),
         None,
     )
     if not element:
@@ -416,6 +421,10 @@ def _cwa_element_values_any(location, names):
     return []
 
 def _to_int(value):
+    if isinstance(value, str):
+        match = re.search(r"-?\d+", value)
+        if match:
+            value = match.group(0)
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -447,7 +456,7 @@ def fetch_weather_summary(city):
                 return f"🌤 中央氣象署查不到「{city}」的鄉鎮市區預報，請確認格式如：新北市淡水區。"
             location_label = f"{county}{_cwa_location_name(location) or district}"
             wx = (_cwa_element_values_any(location, ["天氣現象", "Wx"]) or ["天氣資料"])[0]
-            pops = [_to_int(v) for v in _cwa_element_values_any(location, ["12小時降雨機率", "降雨機率", "PoP12h", "PoP"])]
+            pops = [_to_int(v) for v in _cwa_element_values_any(location, ["12小時降雨機率", "6小時降雨機率", "3小時降雨機率", "降雨機率", "PoP12h", "PoP6h", "PoP"])]
             temps = [_to_int(v) for v in _cwa_element_values_any(location, ["溫度", "平均溫度", "T"])]
             min_ts = [_to_int(v) for v in _cwa_element_values_any(location, ["最低溫度", "MinT"])]
             max_ts = [_to_int(v) for v in _cwa_element_values_any(location, ["最高溫度", "MaxT"])]
