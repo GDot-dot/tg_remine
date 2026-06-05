@@ -65,6 +65,13 @@ class UserSetting(Base):
     telegraph_path            = Column(String(255), nullable=True)
     telegraph_url             = Column(String(255), nullable=True)
     telegraph_access_token    = Column(String(255), nullable=True)
+    telegraph_trackers_path   = Column(String(255), nullable=True)
+    telegraph_trackers_url    = Column(String(255), nullable=True)
+    telegraph_memories_path   = Column(String(255), nullable=True)
+    telegraph_memories_url    = Column(String(255), nullable=True)
+    telegraph_locations_path  = Column(String(255), nullable=True)
+    telegraph_locations_url   = Column(String(255), nullable=True)
+    dashboard_token           = Column(String(255), nullable=True, unique=True)
 
 class Tracker(Base):
     __tablename__ = "trackers"
@@ -104,6 +111,13 @@ def _ensure_user_setting_columns():
             "telegraph_path": "VARCHAR(255)",
             "telegraph_url": "VARCHAR(255)",
             "telegraph_access_token": "VARCHAR(255)",
+            "telegraph_trackers_path": "VARCHAR(255)",
+            "telegraph_trackers_url": "VARCHAR(255)",
+            "telegraph_memories_path": "VARCHAR(255)",
+            "telegraph_memories_url": "VARCHAR(255)",
+            "telegraph_locations_path": "VARCHAR(255)",
+            "telegraph_locations_url": "VARCHAR(255)",
+            "dashboard_token": "VARCHAR(255)",
         }
         for column, column_type in wanted.items():
             if column in columns:
@@ -253,6 +267,10 @@ def update_user_setting(user_id, **fields):
         "morning_summary_time", "evening_summary_time", "snooze_buttons",
         "last_morning_summary_date", "last_evening_summary_date",
         "telegraph_path", "telegraph_url", "telegraph_access_token",
+        "telegraph_trackers_path", "telegraph_trackers_url",
+        "telegraph_memories_path", "telegraph_memories_url",
+        "telegraph_locations_path", "telegraph_locations_url",
+        "dashboard_token",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -275,6 +293,16 @@ def list_user_settings():
     db = SessionLocal()
     try:
         return db.query(UserSetting).all()
+    finally:
+        db.close()
+
+def get_user_setting_by_dashboard_token(token):
+    db = SessionLocal()
+    try:
+        setting = db.query(UserSetting).filter(UserSetting.dashboard_token == str(token)).first()
+        if setting:
+            db.expunge(setting)
+        return setting
     finally:
         db.close()
 

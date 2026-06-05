@@ -4,7 +4,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMa
 
 REPLY_KB = ReplyKeyboardMarkup(
     [
-        ["☰ 功能選單", "📝 Telegraph 清單"],
+        ["☰ 功能選單", "🌐 Web 儀表板"],
+        ["📝 Telegraph 清單"],
         ["⌨️ 隱藏鍵盤"],
     ],
     resize_keyboard=True,
@@ -28,6 +29,9 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("⚙️ 設定", callback_data="menu:設定中心"),
+            InlineKeyboardButton("🌐 儀表板", callback_data="menu:Web儀表板"),
+        ],
+        [
             InlineKeyboardButton("❓ 說明", callback_data="menu:說明"),
         ],
     ])

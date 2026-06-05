@@ -8,7 +8,7 @@ import threading
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from flask import Flask, request
+from flask import Flask, Response, request
 
 import pytz
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -48,6 +48,7 @@ from handlers.settings import (
     show_settings,
 )
 from handlers.stickers import handle_sticker_toggle, handle_sticker_url
+from dashboard_pages import ensure_dashboard_url, render_dashboard_page
 from telegraph_pages import publish_telegraph_list_page
 
 logging.basicConfig(level=logging.INFO,
@@ -162,6 +163,38 @@ def parse_snooze_input(value: str) -> tuple[datetime, str] | None:
     return None
 
 
+def parse_absolute_datetime_input(value: str) -> datetime | None:
+    text = value.strip()
+    now = now_taipei()
+
+    for word, delta in [("今天", 0), ("明天", 1), ("後天", 2)]:
+        m = re.match(rf"^{word}\s*(\d{{1,2}}):(\d{{2}})$", text)
+        if m:
+            return (now + timedelta(days=delta)).replace(
+                hour=int(m.group(1)), minute=int(m.group(2)),
+                second=0, microsecond=0,
+            )
+
+    m = re.match(r"^(\d{1,2})[/\-](\d{1,2})\s+(\d{1,2}):(\d{2})$", text)
+    if m:
+        mo, dy, hh, mm = map(int, m.groups())
+        year = now.year if (mo, dy) >= (now.month, now.day) else now.year + 1
+        try:
+            return TAIPEI_TZ.localize(datetime(year, mo, dy, hh, mm))
+        except ValueError:
+            return None
+
+    m = re.match(r"^(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})\s+(\d{1,2}):(\d{2})$", text)
+    if m:
+        year, mo, dy, hh, mm = map(int, m.groups())
+        try:
+            return TAIPEI_TZ.localize(datetime(year, mo, dy, hh, mm))
+        except ValueError:
+            return None
+
+    return None
+
+
 def parse_custom_reminder_time(value: str, event_dt: datetime) -> tuple[datetime, str] | None:
     text = value.strip()
 
@@ -177,6 +210,10 @@ def parse_custom_reminder_time(value: str, event_dt: datetime) -> tuple[datetime
         hour, minute = map(int, time_str.split(":"))
         reminder_dt = event_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
         return reminder_dt, reminder_dt.strftime("%Y/%m/%d %H:%M")
+
+    absolute_dt = parse_absolute_datetime_input(text)
+    if absolute_dt:
+        return absolute_dt, absolute_dt.strftime("%Y/%m/%d %H:%M")
 
     return None
 
@@ -333,6 +370,14 @@ async def send_web_lists_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await status.edit_text("📝 Telegraph 清單已產生：", reply_markup=markup)
 
 
+async def send_dashboard_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    url = ensure_dashboard_url(update.effective_user.id)
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🌐 開啟 Web 儀表板", url=url)
+    ]])
+    await update.message.reply_text("🌐 Web 儀表板：", reply_markup=markup)
+
+
 async def handle_location_msg_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await handle_location_msg(update, ctx, user_states)
 
@@ -453,7 +498,11 @@ async def cb_custom_reminder_prompt(update: Update, ctx: ContextTypes.DEFAULT_TY
     await q.edit_message_text(
         "🕒 請輸入自訂提醒時間：\n"
         "可輸入提前分鐘數，例如 <code>45</code>、<code>提前120分鐘</code>；\n"
-        "或輸入當天提醒時間，例如 <code>09:30</code>。"
+        "或輸入指定日期時間，例如：\n"
+        "<code>今天 14:00</code>、<code>明天 09:30</code>\n"
+        "<code>06/10 18:00</code>、<code>2026-06-10 18:00</code>\n\n"
+        "只輸入 <code>09:30</code> 時，會用事件當天的 09:30。",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -495,6 +544,7 @@ async def handle_priority_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYP
             rows.append(row); row = []
     if row:
         rows.append(row)
+    rows.append([InlineKeyboardButton("🕒 自訂提醒時間", callback_data="pec")])
     rows.append([InlineKeyboardButton("❌ 取消", callback_data="cancel")])
 
     await reply(update,
@@ -524,6 +574,25 @@ async def cb_priority_early(update: Update, ctx: ContextTypes.DEFAULT_TYPE, minu
     await q.edit_message_text(
         f"提前 {early_txt} 提醒。\n\n請選擇重複提醒的頻率：",
         reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def cb_priority_custom_reminder_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user_id = update.effective_user.id
+    state = user_states.get(user_id, {})
+    if state.get("action") != "priority_pick_early":
+        return
+    state["action"] = "priority_custom_time"
+    await q.edit_message_text(
+        "🕒 請輸入重要提醒的自訂提醒時間：\n"
+        "可輸入提前分鐘數，例如 <code>45</code>、<code>提前120分鐘</code>；\n"
+        "或輸入指定日期時間，例如：\n"
+        "<code>今天 14:00</code>、<code>明天 09:30</code>\n"
+        "<code>06/10 18:00</code>、<code>2026-06-10 18:00</code>\n\n"
+        "自訂時間必須在現在之後，且不能晚於事件時間。",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def cb_priority_level(update: Update, ctx: ContextTypes.DEFAULT_TYPE, level: int):
@@ -557,8 +626,8 @@ async def cb_priority_level(update: Update, ctx: ContextTypes.DEFAULT_TYPE, leve
 
 async def _create_priority_event(update, ctx, q, state, level, interval, repeats):
     dt: datetime   = state["dt"]
-    minutes_early  = state["minutes_early"]
-    reminder_dt    = dt - timedelta(minutes=minutes_early)
+    minutes_early  = state.get("minutes_early")
+    reminder_dt    = state.get("reminder_dt") or (dt - timedelta(minutes=minutes_early))
 
     if reminder_dt <= now_taipei():
         await q.edit_message_text("⚠️ 計算出的提醒時間已過，無法設定。")
@@ -584,7 +653,7 @@ async def _create_priority_event(update, ctx, q, state, level, interval, repeats
     # 自訂 interval 會存進 recurrence_rule，scheduler 會依 custom:N 重排。
 
     safe_add_job(send_reminder, reminder_dt, [event_id], f"reminder_{event_id}")
-    early_txt = next((l for l, m in EARLY_OPTIONS if m == minutes_early), "準時")
+    early_txt = state.get("reminder_label") or next((l for l, m in EARLY_OPTIONS if m == minutes_early), "準時")
     await q.edit_message_text(
         f"{rule_icon} 重要提醒已設定！\n\n"
         f"📅 {dt.strftime('%Y/%m/%d %H:%M')}（{early_txt}開始提醒）\n"
@@ -893,7 +962,11 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             event_dt = ev.event_datetime.astimezone(TAIPEI_TZ)
             parsed = parse_custom_reminder_time(text, event_dt)
             if not parsed:
-                await reply(update, "❌ 請輸入提前分鐘數，或 HH:MM，例如 <code>45</code>、<code>09:30</code>。")
+                await reply(update,
+                    "❌ 格式錯誤，請輸入：\n"
+                    "<code>45</code>、<code>提前120分鐘</code>\n"
+                    "<code>今天 14:00</code>、<code>明天 09:30</code>\n"
+                    "<code>06/10 18:00</code>、<code>2026-06-10 18:00</code>")
                 return
             reminder_dt, label = parsed
             if reminder_dt <= now_taipei() or reminder_dt > event_dt:
@@ -903,6 +976,33 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             safe_add_job(send_reminder, reminder_dt, [event_id], f"reminder_{event_id}")
             user_states.pop(user_id, None)
             await reply(update, f"✅ 設定完成！\n將於 {reminder_dt.strftime('%Y/%m/%d %H:%M')}（{label}）提醒您。")
+            return
+
+        elif action == "priority_custom_time":
+            state = user_states[user_id]
+            event_dt = state["dt"]
+            parsed = parse_custom_reminder_time(text, event_dt)
+            if not parsed:
+                await reply(update,
+                    "❌ 格式錯誤，請輸入：\n"
+                    "<code>45</code>、<code>提前120分鐘</code>\n"
+                    "<code>今天 14:00</code>、<code>明天 09:30</code>\n"
+                    "<code>06/10 18:00</code>、<code>2026-06-10 18:00</code>")
+                return
+            reminder_dt, label = parsed
+            if reminder_dt <= now_taipei() or reminder_dt > event_dt:
+                await reply(update, "⚠️ 自訂提醒時間必須在現在之後，且不能晚於事件時間。")
+                return
+            state["reminder_dt"] = reminder_dt
+            state["reminder_label"] = label
+            state["action"] = "priority_pick_level"
+
+            rows = [[InlineKeyboardButton(label_text, callback_data=f"pl:{level}")]
+                    for label_text, level in PRIORITY_OPTIONS]
+            rows.append([InlineKeyboardButton("❌ 取消", callback_data="cancel")])
+            await reply(update,
+                f"將於 {reminder_dt.strftime('%Y/%m/%d %H:%M')} 提醒。\n\n請選擇重複提醒的頻率：",
+                InlineKeyboardMarkup(rows))
             return
 
         elif action == "recurring_set_time":
@@ -1032,6 +1132,9 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text in ("Telegraph 清單", "📝 Telegraph 清單", "Web 清單", "🌐 Web 清單", "網頁清單"):
         await send_web_lists_link(update, ctx)
         return
+    if text in ("Web 儀表板", "🌐 Web 儀表板", "儀表板", "Dashboard", "dashboard"):
+        await send_dashboard_link(update, ctx)
+        return
     if text in ("貼圖轉換", "🎨 貼圖轉換"):
         await handle_sticker_toggle(update, ctx)
         return
@@ -1114,6 +1217,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await handle_location_list(update, ctx)
             elif cmd == "設定中心":
                 await show_settings(update, ctx)
+            elif cmd == "Web儀表板":
+                await send_dashboard_link(update, ctx)
             elif cmd == "貼圖轉換":
                 await handle_sticker_toggle(update, ctx)
             elif cmd == "說明":
@@ -1140,6 +1245,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # ── 重要提醒：選提早時間  pe:minutes
         elif parts[0] == "pe":
             await cb_priority_early(update, ctx, int(parts[1]))
+        elif parts[0] == "pec":
+            await cb_priority_custom_reminder_prompt(update, ctx)
 
         # ── 重要提醒：選等級  pl:level
         elif parts[0] == "pl":
@@ -1217,6 +1324,13 @@ def root():
 @app.route("/health", methods=["GET"])
 def health():
     return {"status": "ok", "scheduler": scheduler.running}, 200
+
+@app.route("/dashboard/<token>", methods=["GET"])
+def dashboard(token):
+    page = render_dashboard_page(token, notice=request.args.get("notice"))
+    if page is None:
+        return Response("Not found", status=404, mimetype="text/plain; charset=utf-8")
+    return Response(page, mimetype="text/html; charset=utf-8")
 
 @app.route("/webhook", methods=["POST"])
 def webhook():

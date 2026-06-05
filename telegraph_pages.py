@@ -2,7 +2,7 @@
 import html
 import json
 import os
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import pytz
 import requests
@@ -46,12 +46,40 @@ def _h4(text):
     return _node("h4", [text])
 
 
+def _a(text, href):
+    return _node("a", [text], {"href": href})
+
+
 def _li(*children):
     return _node("li", list(children))
 
 
 def _ul(items):
     return _node("ul", items)
+
+
+def _section_nav(reminder_url=None, tracker_url=None, memory_url=None, location_url=None):
+    reminder = _a("提醒", reminder_url) if reminder_url else _node("b", ["提醒"])
+    tracker = _a("追蹤", tracker_url) if tracker_url else "追蹤"
+    memory = _a("記憶", memory_url) if memory_url else "記憶"
+    location = _a("地點", location_url) if location_url else "地點"
+    return _p(
+        reminder, "　",
+        tracker, "　",
+        memory, "　",
+        location,
+    )
+
+
+def _section_title(text):
+    return _h3(text)
+
+
+def _page_header(title, generated_at):
+    return [
+        _p(_node("b", [title])),
+        _p("更新 ", generated_at),
+    ]
 
 
 def _fmt_dt(value):
@@ -74,6 +102,25 @@ def _weekday_names(days):
     return [WEEKDAY_NAMES[WEEKDAY_CODES.index(d)] for d in sorted(days) if d in WEEKDAY_CODES]
 
 
+def _as_taipei(value):
+    if not value:
+        return None
+    try:
+        return value.astimezone(TAIPEI_TZ)
+    except Exception:
+        return value
+
+
+def _short_dt(value):
+    dt = _as_taipei(value)
+    if not dt:
+        return "未設定"
+    try:
+        return dt.strftime("%m/%d %H:%M")
+    except Exception:
+        return str(value)
+
+
 def _memory_plain(content):
     content = content or ""
     if content.startswith(MEMORY_HTML_PREFIX):
@@ -90,19 +137,66 @@ def _dashboard_counts(reminders, memories, trackers, locations):
     )
 
 
+def _reminder_line(ev, show_date=False):
+    dt = _as_taipei(ev.reminder_time)
+    if show_date:
+        time_label = _short_dt(dt)
+    else:
+        time_label = dt.strftime("%H:%M") if dt else "未設定"
+    priority = "重要 · " if ev.priority_level else ""
+    return _li(_node("b", [time_label]), "　", priority, ev.event_content or "(無內容)")
+
+
+def _recurring_line(ev):
+    days, time_str = _parse_recurring_rule(ev.recurrence_rule)
+    day_label = "、".join(_weekday_names(days)) if days else "週期"
+    return _li(_node("b", [time_str]), "　每", day_label, "　", ev.event_content or "(無內容)")
+
+
 def _reminder_nodes(reminders):
     if not reminders:
         return [_p("目前沒有進行中的提醒。")]
-    items = []
+
+    now = _now_taipei()
+    today = now.date()
+    tomorrow = today + timedelta(days=1)
+    next_week = today + timedelta(days=7)
+    dated = []
+    recurring = []
+
     for ev in reminders:
         if ev.is_recurring:
-            days, time_str = _parse_recurring_rule(ev.recurrence_rule)
-            day_label = "、".join(_weekday_names(days)) if days else "週期"
-            meta = f"週期 · 每{day_label} {time_str}"
-        else:
-            meta = f"{'重要 · ' if ev.priority_level else ''}{_fmt_dt(ev.reminder_time)}"
-        items.append(_li(_node("b", [ev.event_content or "(無內容)"]), _node("br"), meta))
-    return [_ul(items)]
+            recurring.append(ev)
+        elif ev.reminder_time:
+            dated.append(ev)
+
+    dated.sort(key=lambda ev: _as_taipei(ev.reminder_time) or datetime.max.replace(tzinfo=TAIPEI_TZ))
+    nodes = []
+
+    groups = [
+        ("今天", lambda d: d == today, False),
+        ("明天", lambda d: d == tomorrow, False),
+        ("接下來 7 天", lambda d: tomorrow < d <= next_week, True),
+        ("更晚", lambda d: d > next_week, True),
+    ]
+    for title, pred, show_date in groups:
+        items = []
+        for ev in dated:
+            dt = _as_taipei(ev.reminder_time)
+            if dt and pred(dt.date()):
+                items.append(_reminder_line(ev, show_date=show_date))
+        if items:
+            nodes.append(_h4(title))
+            nodes.append(_ul(items))
+
+    if recurring:
+        recurring_items = []
+        for ev in recurring:
+            recurring_items.append(_recurring_line(ev))
+        nodes.append(_h4("週期提醒"))
+        nodes.append(_ul(recurring_items))
+
+    return nodes or [_p("目前沒有進行中的提醒。")]
 
 
 def _tracker_meta(t):
@@ -124,6 +218,37 @@ def _tracker_meta(t):
     return " · ".join(bits) if bits else "未設定細節"
 
 
+def _tracker_due_label(t):
+    if t.expire_date:
+        return t.expire_date.strftime("%m/%d")
+    if t.recurring_month and t.recurring_day:
+        return f"{int(t.recurring_month):02d}/{int(t.recurring_day):02d}"
+    return "未設定"
+
+
+def _tracker_brief(t):
+    bits = [_tracker_due_label(t)]
+    if t.amount is not None:
+        cycle_label = {"monthly": "月", "yearly": "年", "once": "次"}
+        cycle = cycle_label.get(t.cycle, "")
+        bits.append(f"{t.amount:.0f}元/{cycle}" if cycle else f"{t.amount:.0f}元")
+    elif t.stock_total and t.stock_daily:
+        bits.append(f"{t.stock_total:g}/{t.stock_daily:g}")
+    return "　".join(bits)
+
+
+def _tracker_sort_key(t):
+    if t.expire_date:
+        return (0, t.expire_date)
+    if t.recurring_month and t.recurring_day:
+        today = _now_taipei().date()
+        candidate = date(today.year, int(t.recurring_month), int(t.recurring_day))
+        if candidate < today:
+            candidate = date(today.year + 1, int(t.recurring_month), int(t.recurring_day))
+        return (1, candidate)
+    return (2, date.max)
+
+
 def _tracker_nodes(trackers):
     if not trackers:
         return [_p("追蹤清單是空的。")]
@@ -136,7 +261,7 @@ def _tracker_nodes(trackers):
     }
     nodes = []
     for category in category_order:
-        items = [t for t in trackers if t.category == category]
+        items = sorted([t for t in trackers if t.category == category], key=_tracker_sort_key)
         if not items:
             continue
         nodes.append(_h4(category_label.get(category, category)))
@@ -147,16 +272,43 @@ def _tracker_nodes(trackers):
     return nodes
 
 
+def _tracker_preview_nodes(trackers, limit=6):
+    if not trackers:
+        return [_p("追蹤清單是空的。")]
+    items = sorted(trackers, key=_tracker_sort_key)[:limit]
+    nodes = [_ul([
+        _li(_node("b", [t.name]), "　", _tracker_brief(t))
+        for t in items
+    ])]
+    if len(trackers) > limit:
+        nodes.append(_p(f"還有 {len(trackers) - limit} 筆，請開啟追蹤頁查看。"))
+    return nodes
+
+
 def _memory_nodes(memories):
     if not memories:
         return [_p("記憶庫是空的。")]
-    nodes = []
+    items = []
     for mem in memories:
         keyword = (mem.keyword or "").strip()
         if not keyword:
             continue
-        nodes.append(_p(_node("b", [keyword]), _node("br"), _memory_plain(mem.content)))
-    return nodes or [_p("記憶庫是空的。")]
+        plain = _memory_plain(mem.content).strip().replace("\n", " ")
+        if len(plain) > 36:
+            plain = plain[:36].rstrip() + "..."
+        items.append(_li(_node("b", [keyword]), *([_node("br"), plain] if plain else [])))
+    return [_ul(items)] if items else [_p("記憶庫是空的。")]
+
+
+def _memory_preview_nodes(memories, limit=12):
+    keywords = [(mem.keyword or "").strip() for mem in memories]
+    keywords = [keyword for keyword in keywords if keyword][:limit]
+    if not keywords:
+        return [_p("記憶庫是空的。")]
+    nodes = [_ul([_li(keyword) for keyword in keywords])]
+    if len(memories) > limit:
+        nodes.append(_p(f"還有 {len(memories) - limit} 筆，請開啟記憶頁查看。"))
+    return nodes
 
 
 def _location_nodes(locations):
@@ -165,12 +317,25 @@ def _location_nodes(locations):
     return [_ul([
         _li(
             _node("b", [loc.name]),
-            _node("br"),
-            f"{loc.latitude:.6f}, {loc.longitude:.6f}",
-            *([_node("br"), loc.address] if loc.address else []),
+            *([_node("br"), loc.address] if loc.address else [
+                _node("br"), f"{loc.latitude:.6f}, {loc.longitude:.6f}",
+            ]),
         )
         for loc in locations
     ])]
+
+
+def _location_preview_nodes(locations, limit=8):
+    items = list(locations)[:limit]
+    if not items:
+        return [_p("目前沒有儲存地點。")]
+    nodes = [_ul([
+        _li(_node("b", [loc.name]))
+        for loc in items
+    ])]
+    if len(locations) > limit:
+        nodes.append(_p(f"還有 {len(locations) - limit} 筆，請開啟地點頁查看。"))
+    return nodes
 
 
 def _get_access_token(user_id, setting):
@@ -199,6 +364,29 @@ def _telegraph_request(method, payload):
     return data["result"]
 
 
+def _upsert_page(user_id, title, content, access_token, path_attr, url_attr):
+    common_payload = {
+        "access_token": access_token,
+        "title": title,
+        "author_name": TELEGRAPH_AUTHOR_NAME,
+        "content": json.dumps(content, ensure_ascii=False),
+        "return_content": "false",
+    }
+    setting = get_user_setting(user_id)
+    path = getattr(setting, path_attr, None)
+    if path:
+        try:
+            page = _telegraph_request("editPage", {"path": path, **common_payload})
+            update_user_setting(user_id, **{path_attr: page.get("path"), url_attr: page.get("url")})
+            return page["url"]
+        except RuntimeError:
+            update_user_setting(user_id, **{path_attr: None, url_attr: None})
+
+    page = _telegraph_request("createPage", common_payload)
+    update_user_setting(user_id, **{path_attr: page.get("path"), url_attr: page.get("url")})
+    return page["url"]
+
+
 def publish_telegraph_list_page(user_id):
     setting = get_user_setting(user_id)
     reminders = [
@@ -208,23 +396,68 @@ def publish_telegraph_list_page(user_id):
     memories = list_memories(user_id)
     trackers = get_trackers(user_id)
     locations = get_locations(user_id)
-    generated_at = _now_taipei().strftime("%Y/%m/%d %H:%M")
+    generated_at = _now_taipei().strftime("%m/%d %H:%M")
+    access_token = _get_access_token(user_id, setting)
+    main_url = getattr(setting, "telegraph_url", None)
+
+    tracker_url = _upsert_page(
+        user_id,
+        "追蹤清單",
+        [
+            *_page_header("追蹤清單", generated_at),
+            _section_nav(reminder_url=main_url),
+            _node("hr"),
+            *_tracker_nodes(trackers),
+        ],
+        access_token,
+        "telegraph_trackers_path",
+        "telegraph_trackers_url",
+    )
+    memory_url = _upsert_page(
+        user_id,
+        "記憶清單",
+        [
+            *_page_header("記憶清單", generated_at),
+            _section_nav(reminder_url=main_url, tracker_url=tracker_url),
+            _node("hr"),
+            *_memory_nodes(memories),
+        ],
+        access_token,
+        "telegraph_memories_path",
+        "telegraph_memories_url",
+    )
+    location_url = _upsert_page(
+        user_id,
+        "地點清單",
+        [
+            *_page_header("地點清單", generated_at),
+            _section_nav(reminder_url=main_url, tracker_url=tracker_url, memory_url=memory_url),
+            _node("hr"),
+            *_location_nodes(locations),
+        ],
+        access_token,
+        "telegraph_locations_path",
+        "telegraph_locations_url",
+    )
 
     content = [
-        _p("GD牌提醒機器人 · ", generated_at),
+        *_page_header("生活清單", generated_at),
         _dashboard_counts(reminders, memories, trackers, locations),
+        _section_nav(tracker_url=tracker_url, memory_url=memory_url, location_url=location_url),
         _node("hr"),
-        _h3("提醒清單"),
+        _section_title("提醒"),
         *_reminder_nodes(reminders),
-        _h3("追蹤清單"),
-        *_tracker_nodes(trackers),
-        _h3("記憶清單"),
-        *_memory_nodes(memories),
-        _h3("地點清單"),
-        *_location_nodes(locations),
+        _section_title("追蹤"),
+        *_tracker_preview_nodes(trackers),
+        _p(_a("開啟追蹤頁", tracker_url)),
+        _section_title("記憶"),
+        *_memory_preview_nodes(memories),
+        _p(_a("開啟記憶頁", memory_url)),
+        _section_title("地點"),
+        *_location_preview_nodes(locations),
+        _p(_a("開啟地點頁", location_url)),
     ]
 
-    access_token = _get_access_token(user_id, setting)
     content_json = json.dumps(content, ensure_ascii=False)
     common_payload = {
         "access_token": access_token,
