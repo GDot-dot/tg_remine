@@ -30,6 +30,9 @@ class Event(Base):
     recurrence_rule     = Column(String(100), nullable=True)
     priority_level      = Column(Integer, default=0)
     remaining_repeats   = Column(Integer, default=0)
+    event_status        = Column(String(20), default="pending")
+    last_reminded_at    = Column(DateTime(timezone=True), nullable=True)
+    completed_at        = Column(DateTime(timezone=True), nullable=True)
 
 class Location(Base):
     __tablename__ = "locations"
@@ -95,9 +98,39 @@ class Tracker(Base):
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    _ensure_event_columns()
     _ensure_user_setting_columns()
     _ensure_tracker_columns()
     logger.info("✅ DB tables created/verified.")
+
+def _ensure_event_columns():
+    try:
+        inspector = inspect(engine)
+        if "events" not in inspector.get_table_names():
+            return
+        columns = {c["name"] for c in inspector.get_columns("events")}
+        dialect = engine.dialect.name
+        wanted = {
+            "event_status": "VARCHAR(20) DEFAULT 'pending'",
+            "last_reminded_at": "TIMESTAMP",
+            "completed_at": "TIMESTAMP",
+        }
+        statements = []
+        for column, column_type in wanted.items():
+            if column in columns:
+                continue
+            if dialect == "postgresql":
+                statements.append(f"ALTER TABLE events ADD COLUMN IF NOT EXISTS {column} {column_type}")
+            else:
+                statements.append(f"ALTER TABLE events ADD COLUMN {column} {column_type}")
+        if not statements:
+            return
+        with engine.begin() as conn:
+            for statement in statements:
+                conn.execute(sql_text(statement))
+        logger.info("✅ Event status columns migrated/verified.")
+    except Exception as e:
+        logger.error(f"ensure event columns: {e}", exc_info=True)
 
 def _ensure_user_setting_columns():
     try:
@@ -172,7 +205,8 @@ def add_event(creator_user_id, target_id, target_type, display_name,
                    event_content=content, event_datetime=event_datetime,
                    reminder_time=event_datetime, reminder_sent=0,
                    is_recurring=is_recurring, recurrence_rule=recurrence_rule,
-                   priority_level=priority_level, remaining_repeats=remaining_repeats)
+                   priority_level=priority_level, remaining_repeats=remaining_repeats,
+                   event_status="pending")
         db.add(ev); db.commit(); db.refresh(ev)
         return ev.id
     except Exception as e:
@@ -197,7 +231,11 @@ def get_user_events(user_id):
 def mark_reminder_sent(event_id):
     db = SessionLocal()
     try:
-        db.query(Event).filter(Event.id == event_id).update({"reminder_sent": 1}); db.commit()
+        db.query(Event).filter(Event.id == event_id).update({
+            "reminder_sent": 1,
+            "event_status": "sent",
+            "last_reminded_at": datetime.utcnow(),
+        }); db.commit()
     finally:
         db.close()
 
@@ -220,6 +258,7 @@ def update_event_fields(event_id, **fields):
     allowed = {
         "event_datetime", "reminder_time", "reminder_sent", "is_recurring",
         "recurrence_rule", "priority_level", "remaining_repeats",
+        "event_status", "last_reminded_at", "completed_at",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -247,6 +286,19 @@ def decrease_remaining_repeats(event_id):
             ev.remaining_repeats -= 1; db.commit()
     finally:
         db.close()
+
+def event_effective_status(event):
+    status = getattr(event, "event_status", None) or "pending"
+    if status == "pending" and getattr(event, "reminder_sent", 0):
+        return "sent"
+    return status
+
+def is_active_event(event):
+    if getattr(event, "is_recurring", 0):
+        return True
+    if not getattr(event, "reminder_time", None):
+        return False
+    return event_effective_status(event) in ("pending", "snoozed")
 
 def get_user_setting(user_id):
     db = SessionLocal()

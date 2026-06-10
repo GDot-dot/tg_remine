@@ -5,7 +5,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMa
 REPLY_KB = ReplyKeyboardMarkup(
     [
         ["☰ 功能選單", "🌐 Web 儀表板"],
-        ["📝 Telegraph 清單"],
+        ["📝 Telegraph 快照"],
         ["⌨️ 隱藏鍵盤"],
     ],
     resize_keyboard=True,

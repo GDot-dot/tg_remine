@@ -9,7 +9,7 @@ import requests
 
 from db import (
     get_locations, get_trackers, get_user_events, get_user_setting,
-    list_memories, update_user_setting,
+    event_effective_status, is_active_event, list_memories, update_user_setting,
 )
 
 TAIPEI_TZ = pytz.timezone("Asia/Taipei")
@@ -19,6 +19,14 @@ TELEGRAPH_API = "https://api.telegra.ph"
 WEEKDAY_CODES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 WEEKDAY_NAMES = ["一", "二", "三", "四", "五", "六", "日"]
 MEMORY_HTML_PREFIX = "__TG_MEMORY_HTML__\n"
+STATUS_LABELS = {
+    "pending": "待提醒",
+    "sent": "已提醒",
+    "snoozed": "已延後",
+    "confirmed": "已確認",
+    "completed": "已完成",
+    "failed": "失敗",
+}
 
 
 def _now_taipei():
@@ -82,6 +90,10 @@ def _page_header(title, generated_at):
     ]
 
 
+def _snapshot_note():
+    return _p("這是唯讀快照，用來快速閱讀與分享；新增、修改、完成提醒請回 Telegram 或 Web 儀表板操作。")
+
+
 def _fmt_dt(value):
     if not value:
         return "未設定時間"
@@ -143,8 +155,9 @@ def _reminder_line(ev, show_date=False):
         time_label = _short_dt(dt)
     else:
         time_label = dt.strftime("%H:%M") if dt else "未設定"
+    status = STATUS_LABELS.get(event_effective_status(ev), "待提醒")
     priority = "重要 · " if ev.priority_level else ""
-    return _li(_node("b", [time_label]), "　", priority, ev.event_content or "(無內容)")
+    return _li(_node("b", [time_label]), "　", priority, status, "　", ev.event_content or "(無內容)")
 
 
 def _recurring_line(ev):
@@ -174,6 +187,7 @@ def _reminder_nodes(reminders):
     nodes = []
 
     groups = [
+        ("逾期/未處理", lambda d: d < today, True),
         ("今天", lambda d: d == today, False),
         ("明天", lambda d: d == tomorrow, False),
         ("接下來 7 天", lambda d: tomorrow < d <= next_week, True),
@@ -183,7 +197,9 @@ def _reminder_nodes(reminders):
         items = []
         for ev in dated:
             dt = _as_taipei(ev.reminder_time)
-            if dt and pred(dt.date()):
+            status = event_effective_status(ev)
+            matched = status != "sent" and bool(dt and pred(dt.date()))
+            if matched:
                 items.append(_reminder_line(ev, show_date=show_date))
         if items:
             nodes.append(_h4(title))
@@ -391,7 +407,7 @@ def publish_telegraph_list_page(user_id):
     setting = get_user_setting(user_id)
     reminders = [
         ev for ev in get_user_events(str(user_id))
-        if ev.is_recurring or (not ev.reminder_sent and ev.reminder_time is not None)
+        if is_active_event(ev)
     ]
     memories = list_memories(user_id)
     trackers = get_trackers(user_id)
@@ -405,6 +421,7 @@ def publish_telegraph_list_page(user_id):
         "追蹤清單",
         [
             *_page_header("追蹤清單", generated_at),
+            _snapshot_note(),
             _section_nav(reminder_url=main_url),
             _node("hr"),
             *_tracker_nodes(trackers),
@@ -418,6 +435,7 @@ def publish_telegraph_list_page(user_id):
         "記憶清單",
         [
             *_page_header("記憶清單", generated_at),
+            _snapshot_note(),
             _section_nav(reminder_url=main_url, tracker_url=tracker_url),
             _node("hr"),
             *_memory_nodes(memories),
@@ -431,6 +449,7 @@ def publish_telegraph_list_page(user_id):
         "地點清單",
         [
             *_page_header("地點清單", generated_at),
+            _snapshot_note(),
             _section_nav(reminder_url=main_url, tracker_url=tracker_url, memory_url=memory_url),
             _node("hr"),
             *_location_nodes(locations),
@@ -441,7 +460,8 @@ def publish_telegraph_list_page(user_id):
     )
 
     content = [
-        *_page_header("生活清單", generated_at),
+        *_page_header("生活快照", generated_at),
+        _snapshot_note(),
         _dashboard_counts(reminders, memories, trackers, locations),
         _section_nav(tracker_url=tracker_url, memory_url=memory_url, location_url=location_url),
         _node("hr"),
@@ -461,7 +481,7 @@ def publish_telegraph_list_page(user_id):
     content_json = json.dumps(content, ensure_ascii=False)
     common_payload = {
         "access_token": access_token,
-        "title": "清單紀錄",
+        "title": "生活快照",
         "author_name": TELEGRAPH_AUTHOR_NAME,
         "content": content_json,
         "return_content": "false",

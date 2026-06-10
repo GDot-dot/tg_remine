@@ -95,7 +95,7 @@ def _is_retryable_tg_result(result):
 
 def _retry_reminder(event_id, reason):
     retry_at = datetime.now(TAIPEI_TZ) + timedelta(minutes=REMINDER_RETRY_DELAY)
-    update_event_fields(event_id, reminder_time=retry_at, reminder_sent=0)
+    update_event_fields(event_id, reminder_time=retry_at, reminder_sent=0, event_status="pending", completed_at=None)
     safe_add_job(send_reminder, retry_at, [event_id], f"reminder_{event_id}")
     logger.warning(
         "Reminder %s send failed; retry scheduled at %s. reason=%s",
@@ -104,11 +104,13 @@ def _retry_reminder(event_id, reason):
 
 def _finish_failed_reminder(db, event, reason):
     logger.error("Reminder %s failed permanently: %s", event.id, reason)
-    mark_reminder_sent(event.id)
+    update_event_fields(
+        event.id,
+        reminder_sent=1,
+        event_status="failed",
+        last_reminded_at=datetime.now(TAIPEI_TZ),
+    )
     _remove_job(event.id)
-    if event.priority_level > 0:
-        db.query(Event).filter(Event.id == event.id).delete()
-        db.commit()
 
 def _parse_snooze_buttons(raw):
     buttons = []
@@ -140,14 +142,34 @@ def _confirm_kb(event):
     rows.append([{"text": "🕒 自訂延後", "callback_data": f"snc:{event_id}"}])
     return {"inline_keyboard": rows}
 
-def _priority_kb(event_id):
-    return {"inline_keyboard": [[{"text": "✅ 收到，停止提醒", "callback_data": f"cr:{event_id}"}]]}
+def _priority_interval(event):
+    if event.recurrence_rule and event.recurrence_rule.startswith("custom:"):
+        try:
+            return int(event.recurrence_rule.split(":", 1)[1])
+        except (TypeError, ValueError):
+            pass
+    return PRIORITY_RULES[event.priority_level]["interval"]
+
+def _priority_kb(event):
+    event_id = event.id
+    user_id = getattr(event, "creator_user_id", None)
+    buttons = _parse_snooze_buttons(get_user_setting(user_id).snooze_buttons) if user_id else [5, 30, 60]
+    rows = [[{"text": "✅ 完成，停止重提", "callback_data": f"cr:{event_id}"}]]
+    rows.append([
+        {"text": f"💤 {_snooze_label(minutes)}", "callback_data": f"sn:{event_id}:{minutes}"}
+        for minutes in buttons
+    ])
+    rows.append([{"text": "🕒 自訂延後", "callback_data": f"snc:{event_id}"}])
+    return {"inline_keyboard": rows}
 
 def send_reminder(event_id):
     db = SessionLocal()
     try:
         event = db.query(Event).filter(Event.id == event_id).first()
         if not event: _remove_job(event_id); return
+        if getattr(event, "event_status", None) in ("completed", "failed", "deleted"):
+            _remove_job(event_id)
+            return
         if not event.is_recurring and event.reminder_sent: return
 
         chat_id = event.target_id
@@ -159,7 +181,18 @@ def send_reminder(event_id):
 
         if event.priority_level > 0:
             icon = PRIORITY_RULES[event.priority_level]["icon"]
-            sent, send_result = tg_send(chat_id, f"{icon} <b>重要提醒！</b>\n\n@{name}\n記得要「{content}」！\n(未確認將繼續提醒)", _priority_kb(event_id))
+            interval = _priority_interval(event)
+            repeats = max(event.remaining_repeats or 0, 0)
+            repeat_line = (
+                f"\n\n未完成會在 {interval} 分鐘後重提，剩餘 {repeats} 次。"
+                if repeats > 0
+                else "\n\n這是最後一次重提。"
+            )
+            sent, send_result = tg_send(
+                chat_id,
+                f"{icon} <b>重要提醒！</b>\n\n@{name}\n記得要「{content}」！{repeat_line}",
+                _priority_kb(event),
+            )
         elif event.is_recurring:
             sent, send_result = tg_send(chat_id, f"⏰ 週期提醒\n\n@{name}\n記得要「{content}」喔！", _confirm_kb(event))
         else:
@@ -179,20 +212,22 @@ def send_reminder(event_id):
             return
 
         if not event.is_recurring:
+            reminded_at = datetime.now(TAIPEI_TZ)
             if event.priority_level > 0 and event.remaining_repeats > 0:
                 decrease_remaining_repeats(event_id)
-                # 支援自訂 interval（recurrence_rule = "custom:N"）
-                if event.recurrence_rule and event.recurrence_rule.startswith("custom:"):
-                    interval = int(event.recurrence_rule.split(":")[1])
-                else:
-                    interval = PRIORITY_RULES[event.priority_level]["interval"]
-                next_run = datetime.now(TAIPEI_TZ) + timedelta(minutes=interval)
+                interval = _priority_interval(event)
+                next_run = reminded_at + timedelta(minutes=interval)
+                update_event_fields(
+                    event_id,
+                    reminder_time=next_run,
+                    event_status="pending",
+                    last_reminded_at=reminded_at,
+                )
                 safe_add_job(send_reminder, next_run, [event_id], f"reminder_{event_id}")
             else:
+                update_event_fields(event_id, event_status="sent", last_reminded_at=reminded_at)
                 mark_reminder_sent(event_id)
                 _remove_job(event_id)
-                if event.priority_level > 0:
-                    db.query(Event).filter(Event.id == event_id).delete(); db.commit()
     except Exception as e:
         logger.error(f"send_reminder (id={event_id}): {e}", exc_info=True)
     finally:
