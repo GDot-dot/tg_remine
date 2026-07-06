@@ -9,7 +9,7 @@ from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
 from db import get_user_setting, update_user_setting
-from scheduler import build_daily_summary, fetch_weather_summary
+from scheduler import build_daily_summary, fetch_weather_summary, schedule_user_summary_jobs
 
 TAIPEI_TZ = pytz.timezone("Asia/Taipei")
 
@@ -152,10 +152,12 @@ async def handle_settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYP
         return
     if action == "morning_toggle":
         update_user_setting(user_id, morning_summary_enabled=0 if setting.morning_summary_enabled else 1)
+        schedule_user_summary_jobs(user_id)
         await show_settings(update, ctx)
         return
     if action == "evening_toggle":
         update_user_setting(user_id, evening_summary_enabled=0 if setting.evening_summary_enabled else 1)
+        schedule_user_summary_jobs(user_id)
         await show_settings(update, ctx)
         return
     if action == "weather_preview":
@@ -188,6 +190,7 @@ async def handle_settings_state(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
             return True
         user_states.pop(user_id, None)
         update_user_setting(user_id, morning_summary_time=time_str, morning_summary_enabled=1)
+        schedule_user_summary_jobs(user_id)
         await update.message.reply_text(f"✅ 今日摘要時間已更新為：{time_str}", parse_mode=ParseMode.HTML)
         await show_settings(update, ctx)
         return True
@@ -199,6 +202,7 @@ async def handle_settings_state(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
             return True
         user_states.pop(user_id, None)
         update_user_setting(user_id, evening_summary_time=time_str, evening_summary_enabled=1)
+        schedule_user_summary_jobs(user_id)
         await update.message.reply_text(f"✅ 明日預告時間已更新為：{time_str}", parse_mode=ParseMode.HTML)
         await show_settings(update, ctx)
         return True

@@ -6,7 +6,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.executors.pool import ThreadPoolExecutor
 from db import (
-    DATABASE_URL, SessionLocal, Event, mark_reminder_sent,
+    engine, SessionLocal, Event, mark_reminder_sent,
     decrease_remaining_repeats, update_event_fields,
     get_user_setting, list_user_settings, update_user_setting,
 )
@@ -16,7 +16,9 @@ TAIPEI_TZ = pytz.timezone("Asia/Taipei")
 TG_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CWA_AUTHORIZATION = os.environ.get("CWA_AUTHORIZATION") or os.environ.get("CWA_API_KEY", "")
 TG_RETRY_DELAYS = (1, 3, 5)
+DB_OPERATION_RETRY_DELAYS = (1, 3, 5)
 REMINDER_RETRY_DELAY = 5
+RECURRING_RETRY_LIMIT = 3
 WEEKDAY_CODES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 CWA_CITY_ALIASES = {
     "台北": "臺北市", "臺北": "臺北市", "台北市": "臺北市",
@@ -45,7 +47,7 @@ PRIORITY_RULES = {
     3: {"icon": "🔴", "interval":  5, "repeats": 12},
 }
 
-jobstores    = {"default": SQLAlchemyJobStore(url=DATABASE_URL, engine_options={"pool_pre_ping": True, "pool_recycle": 300})}
+jobstores    = {"default": SQLAlchemyJobStore(engine=engine)}
 executors    = {"default": ThreadPoolExecutor(max_workers=5)}
 job_defaults = {"coalesce": True, "max_instances": 1, "misfire_grace_time": 60}
 scheduler_lock = threading.RLock()
@@ -162,7 +164,28 @@ def _priority_kb(event):
     rows.append([{"text": "🕒 自訂延後", "callback_data": f"snc:{event_id}"}])
     return {"inline_keyboard": rows}
 
-def send_reminder(event_id):
+def _schedule_recurring_retry(event_id, retry_attempt, reason):
+    if retry_attempt >= RECURRING_RETRY_LIMIT:
+        logger.error(
+            "Recurring reminder %s exhausted %s retries. reason=%s",
+            event_id, RECURRING_RETRY_LIMIT, reason,
+        )
+        return
+    next_attempt = retry_attempt + 1
+    retry_at = datetime.now(TAIPEI_TZ) + timedelta(minutes=REMINDER_RETRY_DELAY)
+    job_id = f"recurring_retry_{event_id}"
+    scheduled = safe_add_job(send_reminder, retry_at, [event_id, next_attempt], job_id)
+    if scheduled:
+        logger.warning(
+            "Recurring reminder %s failed; retry %s/%s scheduled at %s. reason=%s",
+            event_id, next_attempt, RECURRING_RETRY_LIMIT,
+            retry_at.isoformat(), reason,
+        )
+    else:
+        logger.error("Could not schedule recurring retry for reminder %s", event_id)
+
+
+def send_reminder(event_id, retry_attempt=0):
     db = SessionLocal()
     try:
         event = db.query(Event).filter(Event.id == event_id).first()
@@ -208,11 +231,22 @@ def send_reminder(event_id):
                 else:
                     _finish_failed_reminder(db, event, send_result)
             else:
-                logger.warning("Recurring reminder %s send failed: %s", event_id, send_result)
+                _schedule_recurring_retry(event_id, retry_attempt, send_result)
             return
 
-        if not event.is_recurring:
-            reminded_at = datetime.now(TAIPEI_TZ)
+        message_id = (send_result.get("result") or {}).get("message_id")
+        logger.info(
+            "Reminder delivered event_id=%s chat_id=%s message_id=%s recurring=%s retry_attempt=%s",
+            event_id, chat_id, message_id, bool(event.is_recurring), retry_attempt,
+        )
+
+        reminded_at = datetime.now(TAIPEI_TZ)
+        if event.is_recurring:
+            update_event_fields(event_id, last_reminded_at=reminded_at)
+            retry_job_id = f"recurring_retry_{event_id}"
+            if scheduler.get_job(retry_job_id):
+                scheduler.remove_job(retry_job_id)
+        else:
             if event.priority_level > 0 and event.remaining_repeats > 0:
                 decrease_remaining_repeats(event_id)
                 interval = _priority_interval(event)
@@ -253,8 +287,17 @@ def safe_add_cron(func, args, job_id, day_of_week, hour, minute):
         except Exception as e:
             logger.error(f"safe_add_cron ({job_id}): {e}"); return False
 
+def safe_remove_job_id(job_id):
+    with scheduler_lock:
+        try:
+            if scheduler.get_job(job_id):
+                scheduler.remove_job(job_id)
+            return True
+        except Exception as e:
+            logger.error(f"safe_remove_job_id ({job_id}): {e}"); return False
+
 def _remove_job(event_id):
-    for prefix in ("reminder_", "recurring_"):
+    for prefix in ("reminder_", "recurring_", "recurring_retry_"):
         jid = f"{prefix}{event_id}"
         if scheduler.get_job(jid):
             try: scheduler.remove_job(jid)
@@ -263,7 +306,7 @@ def _remove_job(event_id):
 def remove_job(event_id):
     _remove_job(event_id)
 
-def restore_jobs():
+def _restore_jobs_once():
     db = SessionLocal()
     try:
         now = datetime.now(TAIPEI_TZ)
@@ -272,8 +315,10 @@ def restore_jobs():
             Event.reminder_sent == 0,
             Event.is_recurring == 0,
             Event.reminder_time.isnot(None),
+            Event.event_status.in_(("pending", "snoozed")),
         ).all()
         count = 0
+        overdue_count = 0
         for ev in recurring + pending_one:
             is_rec = ev.is_recurring
             job_id = f"{'recurring' if is_rec else 'reminder'}_{ev.id}"
@@ -282,21 +327,42 @@ def restore_jobs():
                 if is_rec and ev.recurrence_rule:
                     days, t = ev.recurrence_rule.split("|")
                     h, m = map(int, t.split(":"))
-                    safe_add_cron(send_reminder, [ev.id], job_id, days.lower(), h, m)
+                    restored = safe_add_cron(send_reminder, [ev.id], job_id, days.lower(), h, m)
                 else:
                     run_at = ev.reminder_time.astimezone(TAIPEI_TZ)
                     if run_at <= now:
-                        run_at = now + timedelta(seconds=10)
+                        run_at = now + timedelta(seconds=10 + overdue_count * 2)
+                        overdue_count += 1
                         logger.warning("Restoring missed reminder %s for immediate retry.", ev.id)
-                    safe_add_job(send_reminder, run_at, [ev.id], job_id)
+                    restored = safe_add_job(send_reminder, run_at, [ev.id], job_id)
+                if not restored:
+                    raise RuntimeError(f"Could not restore scheduler job {job_id}")
                 count += 1
+            except RuntimeError:
+                raise
             except Exception as e:
                 logger.error(f"restore event {ev.id}: {e}")
         logger.info(f"✅ 還原完成，共 {count} 個排程。")
-    except Exception as e:
-        logger.error(f"restore_jobs: {e}", exc_info=True)
     finally:
         db.close()
+
+
+def restore_jobs():
+    last_error = None
+    for attempt, delay in enumerate(DB_OPERATION_RETRY_DELAYS, start=1):
+        try:
+            _restore_jobs_once()
+            return
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "restore_jobs failed attempt %s/%s: %s",
+                attempt, len(DB_OPERATION_RETRY_DELAYS), e,
+                exc_info=attempt == len(DB_OPERATION_RETRY_DELAYS),
+            )
+            if attempt < len(DB_OPERATION_RETRY_DELAYS):
+                time.sleep(delay)
+    logger.error("restore_jobs exhausted retries: %s", last_error)
 
 def safe_start():
     with scheduler_lock:
@@ -406,6 +472,7 @@ def _cwa_element_value(element_value):
         "ProbabilityOfPrecipitation",
         "Temperature", "MaxTemperature", "MinTemperature",
         "ComfortIndexDescription", "ComfortIndex",
+        "UVIndex", "UVI", "ExposureLevel",
     )
     if isinstance(element_value, dict):
         for key in preferred_keys:
@@ -455,6 +522,47 @@ def _cwa_element_values_any(location, names):
             return values
     return []
 
+def _cwa_element_time_values(location, element_name):
+    elements = _cwa_as_list(_cwa_get(location, "weatherElement", "WeatherElement"))
+    normalized_element_name = _normalize_cwa_name(element_name)
+    element = next(
+        (
+            e for e in elements
+            if _normalize_cwa_name(_cwa_get(e, "elementName", "ElementName")) == normalized_element_name
+        ),
+        None,
+    )
+    if not element:
+        return []
+
+    values = []
+    for item in _cwa_as_list(_cwa_get(element, "time", "Time")):
+        value = None
+        parameter = _cwa_get(item, "parameter", "Parameter") or {}
+        parameter_name = _cwa_get(parameter, "parameterName", "ParameterName")
+        if parameter_name is not None:
+            value = str(parameter_name).strip()
+        else:
+            for element_value in _cwa_as_list(_cwa_get(item, "elementValue", "ElementValue")):
+                value = _cwa_element_value(element_value)
+                if value is not None:
+                    break
+        if value is None:
+            continue
+        values.append({
+            "start": _cwa_get(item, "startTime", "StartTime", "dataTime", "DataTime"),
+            "end": _cwa_get(item, "endTime", "EndTime"),
+            "value": value,
+        })
+    return values
+
+def _cwa_element_time_values_any(location, names):
+    for name in names:
+        values = _cwa_element_time_values(location, name)
+        if values:
+            return values
+    return []
+
 def _to_int(value):
     if isinstance(value, str):
         match = re.search(r"-?\d+", value)
@@ -464,6 +572,91 @@ def _to_int(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+def _to_float(value):
+    if isinstance(value, str):
+        match = re.search(r"-?\d+(?:\.\d+)?", value)
+        if match:
+            value = match.group(0)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+def _parse_cwa_time(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+def _format_uv_time(entry):
+    start = _parse_cwa_time(entry.get("start"))
+    end = _parse_cwa_time(entry.get("end"))
+    if start and end:
+        return f"{start.astimezone(TAIPEI_TZ).strftime('%H:%M')}-{end.astimezone(TAIPEI_TZ).strftime('%H:%M')}"
+    if start:
+        return start.astimezone(TAIPEI_TZ).strftime("%H:%M")
+    return "時間未定"
+
+def _uv_level(value):
+    if value >= 11:
+        return "危險"
+    if value >= 8:
+        return "過量"
+    if value >= 6:
+        return "高量"
+    if value >= 3:
+        return "中量"
+    return "低量"
+
+def _uv_advice(max_uv):
+    if max_uv >= 8:
+        return "避免久曬，帽子、太陽眼鏡、防曬都要上。"
+    if max_uv >= 6:
+        return "中午前後減少曝曬，外出記得防曬。"
+    if max_uv >= 3:
+        return "長時間戶外仍建議防曬。"
+    return "紫外線偏低，基本防曬即可。"
+
+def _uv_curve(values):
+    blocks = "▁▂▃▄▅▆▇█"
+    points = []
+    for item in values[:8]:
+        uv = _to_float(item.get("value"))
+        if uv is None:
+            continue
+        index = min(len(blocks) - 1, max(0, int(round(uv / 11 * (len(blocks) - 1)))))
+        points.append(blocks[index])
+    return "".join(points)
+
+def build_uv_summary(location):
+    uv_values = _cwa_element_time_values_any(
+        location,
+        ["紫外線指數", "紫外線", "UVI", "UVIndex", "UV Index"],
+    )
+    parsed = [
+        {**item, "uv": _to_float(item.get("value"))}
+        for item in uv_values
+    ]
+    parsed = [item for item in parsed if item["uv"] is not None]
+    if not parsed:
+        return ""
+
+    max_item = max(parsed, key=lambda item: item["uv"])
+    max_uv = max_item["uv"]
+    risky = [item for item in parsed if item["uv"] >= 6]
+    if risky:
+        risk_time = "、".join(_format_uv_time(item) for item in risky[:3])
+    else:
+        risk_time = _format_uv_time(max_item)
+    curve = _uv_curve(parsed)
+    value_text = f"{max_uv:.0f}" if max_uv.is_integer() else f"{max_uv:.1f}"
+    return (
+        f"\n☀️ 紫外線 {curve} 最高 {value_text}（{_uv_level(max_uv)}），"
+        f"注意時間：{risk_time}。{_uv_advice(max_uv)}"
+    )
 
 def fetch_weather_summary(city):
     if not city:
@@ -528,7 +721,8 @@ def fetch_weather_summary(city):
         temp_max = max(max_values or temp_values) if (max_values or temp_values) else None
         temp = f"{temp_min}-{temp_max}°C" if temp_min is not None and temp_max is not None else "溫度未知"
         rain_text = f"降雨機率 {rain}%" if rain is not None else "降雨機率未知"
-        return f"🌤 {location_label}今日天氣：{wx}，{temp}，{rain_text}。{_weather_advice(wx, rain, temp_max, comfort)}"
+        uv_summary = build_uv_summary(location)
+        return f"🌤 {location_label}今日天氣：{wx}，{temp}，{rain_text}。{_weather_advice(wx, rain, temp_max, comfort)}{uv_summary}"
     except Exception as e:
         logger.warning("fetch CWA weather failed for %s: %s", city, e)
         return "🌤 中央氣象署天氣資料暫時讀取失敗。"
@@ -616,15 +810,71 @@ def scan_daily_summaries():
         except Exception as e:
             logger.error("scan_daily_summary user=%s: %s", getattr(setting, "user_id", "?"), e, exc_info=True)
 
+def _hhmm_parts(value):
+    if not _valid_hhmm(value):
+        return None
+    hour, minute = map(int, value.split(":"))
+    return hour, minute
+
+def send_daily_summary(user_id, period):
+    setting = get_user_setting(user_id)
+    today = datetime.now(TAIPEI_TZ).date()
+    try:
+        if period == "morning":
+            if not setting.morning_summary_enabled or setting.last_morning_summary_date == today:
+                return
+            text = build_daily_summary(
+                setting.user_id, today, "🌅 今日摘要",
+                bool(setting.weather_enabled), setting.city,
+            )
+            sent, result = tg_send(setting.user_id, text)
+            if sent:
+                update_user_setting(setting.user_id, last_morning_summary_date=today)
+            else:
+                logger.warning("morning summary failed for %s: %s", setting.user_id, result)
+            return
+
+        if period == "evening":
+            if not setting.evening_summary_enabled or setting.last_evening_summary_date == today:
+                return
+            text = build_daily_summary(setting.user_id, today + timedelta(days=1), "🌙 明日預告")
+            sent, result = tg_send(setting.user_id, text)
+            if sent:
+                update_user_setting(setting.user_id, last_evening_summary_date=today)
+            else:
+                logger.warning("evening summary failed for %s: %s", setting.user_id, result)
+    except Exception as e:
+        logger.error("send_daily_summary user=%s period=%s: %s", user_id, period, e, exc_info=True)
+
+def schedule_user_summary_jobs(user_id):
+    setting = get_user_setting(user_id)
+    safe_remove_job_id(f"summary_morning_{setting.user_id}")
+    safe_remove_job_id(f"summary_evening_{setting.user_id}")
+
+    if setting.morning_summary_enabled:
+        parts = _hhmm_parts(setting.morning_summary_time)
+        if parts:
+            h, m = parts
+            safe_add_cron(send_daily_summary, [setting.user_id, "morning"],
+                          f"summary_morning_{setting.user_id}", "*", h, m)
+    if setting.evening_summary_enabled:
+        parts = _hhmm_parts(setting.evening_summary_time)
+        if parts:
+            h, m = parts
+            safe_add_cron(send_daily_summary, [setting.user_id, "evening"],
+                          f"summary_evening_{setting.user_id}", "*", h, m)
+
 def start_daily_summary_scan():
     with scheduler_lock:
-        if not scheduler.get_job("daily_summary_scan"):
-            safe_add_cron(scan_daily_summaries, [], "daily_summary_scan", "*", "*", "*/5")
-            logger.info("✅ 每日摘要掃描排程已啟動")
+        safe_remove_job_id("daily_summary_scan")
+        for setting in list_user_settings():
+            schedule_user_summary_jobs(setting.user_id)
+        safe_add_cron(scan_daily_summaries, [], "daily_summary_catchup_scan", "*", 23, 55)
+        logger.info("✅ 每日摘要掃描排程已啟動")
 
 # ── Tracker 每日掃描 ──────────────────────────────────────────────────────────
 
-def scan_trackers():
+def scan_trackers(target_hhmm=None):
     """定期掃描追蹤項目，到期前依各項目的 remind_time 發提醒。"""
     from db import get_all_trackers, mark_tracker_reminded
     from datetime import date, timedelta
@@ -640,7 +890,9 @@ def scan_trackers():
             if remind_days < 0:
                 continue
             remind_time = (t.remind_time or "08:00")[:5]
-            if now_hhmm < remind_time:
+            if target_hhmm and remind_time != target_hhmm:
+                continue
+            if not target_hhmm and now_hhmm < remind_time:
                 continue
             if t.last_reminded_date == today:
                 continue
@@ -709,8 +961,37 @@ def _send_tracker_alert(t, next_date, days_left):
     tg_send(t.user_id, "\n".join(lines))
 
 def start_tracker_scan():
+    """Restore tracker scans at the distinct reminder times currently in use."""
+    from db import get_all_trackers
+
+    with scheduler_lock:
+        for job in list(scheduler.get_jobs()):
+            if job.id == "daily_tracker_scan" or job.id.startswith("tracker_scan_"):
+                safe_remove_job_id(job.id)
+
+        times = set()
+        for tracker in get_all_trackers():
+            try:
+                if tracker.remind_days is not None and tracker.remind_days < 0:
+                    continue
+                remind_time = (tracker.remind_time or "08:00")[:5]
+                if _valid_hhmm(remind_time):
+                    times.add(remind_time)
+            except Exception:
+                continue
+
+        for remind_time in sorted(times):
+            h, m = map(int, remind_time.split(":"))
+            safe_add_cron(
+                scan_trackers, [remind_time],
+                f"tracker_scan_{remind_time.replace(':', '')}",
+                "*", h, m,
+            )
+        safe_add_cron(scan_trackers, [], "tracker_catchup_scan", "*", 23, 50)
+        logger.info("Tracker precise scan jobs restored for %s reminder times.", len(times))
+
+def _old_start_tracker_scan():
     """啟動 tracker 掃描排程。"""
     with scheduler_lock:
-        if not scheduler.get_job("daily_tracker_scan"):
-            safe_add_cron(scan_trackers, [], "daily_tracker_scan", "*", "*", "*/5")
-            logger.info("✅ Tracker 每日掃描排程已啟動")
+        safe_add_cron(scan_trackers, [], "daily_tracker_scan", "*", "*", "*/15")
+        logger.info("✅ Tracker 每日掃描排程已啟動")

@@ -1,5 +1,5 @@
 # db.py
-import os, logging
+import os, logging, time
 from datetime import datetime, date as date_type
 from sqlalchemy import (create_engine, Column, Integer, String, Float, DateTime, Date, Text, UniqueConstraint, inspect, text as sql_text)
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -11,7 +11,37 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300, pool_size=5, max_overflow=10)
+DB_CONNECT_RETRY_DELAYS = (0, 1, 3)
+
+
+def _connect_postgres_with_retry():
+    import psycopg2
+
+    last_error = None
+    for attempt, delay in enumerate(DB_CONNECT_RETRY_DELAYS, start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+        except psycopg2.OperationalError as e:
+            last_error = e
+            logger.warning(
+                "Database connection failed attempt %s/%s: %s",
+                attempt, len(DB_CONNECT_RETRY_DELAYS), e,
+            )
+    raise last_error
+
+
+engine_options = {
+    "pool_pre_ping": True,
+    "pool_recycle": 300,
+    "pool_size": 5,
+    "max_overflow": 10,
+}
+if DATABASE_URL.startswith("postgresql://"):
+    engine_options["creator"] = _connect_postgres_with_retry
+
+engine = create_engine(DATABASE_URL, **engine_options)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 

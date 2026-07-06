@@ -6,7 +6,7 @@ import html
 import threading
 import asyncio
 import logging
-from flask import Flask, Response, request
+from flask import Flask, Response, jsonify, request
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -15,8 +15,8 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from db import init_db
-from scheduler import scheduler, safe_start
+from db import get_user_setting_by_dashboard_token, init_db
+from scheduler import scheduler, safe_start, start_tracker_scan
 from handlers.tracker import (
     handle_tracker_input, handle_tracker_list,
     handle_monthly_cost, handle_tracker_delete,
@@ -34,9 +34,11 @@ from handlers.reminders import (
     cb_confirm, cb_custom_reminder_prompt, cb_delete_ok, cb_delete_prompt,
     cb_edit_content_prompt, cb_edit_priority_prompt, cb_edit_prompt, cb_edit_time_prompt,
     cb_priority_custom_reminder_prompt, cb_priority_early, cb_priority_level,
+    cb_reminder_preview,
     cb_rec_settime, cb_rec_toggle, cb_set_reminder, cb_snooze, cb_snooze_custom_prompt,
     handle_priority_reminder, handle_recurring, handle_reminder, handle_reminder_list,
-    handle_reminder_state, looks_like_natural_reminder,
+    handle_reminder_preview,
+    handle_reminder_state, looks_like_important_reminder, looks_like_natural_reminder,
 )
 from handlers.memory import (
     cb_mem_delete_ok, cb_mem_delete_prompt, cb_mem_edit_prompt, cb_mem_view,
@@ -84,6 +86,7 @@ HELP_TEXT = """🤖 <b>Telegram 智慧管家</b>
 <i>日期可用：今天 / 明天 / 後天 / MM/DD / YYYY-MM-DD（空格可省略）</i>
 也可說：<code>明天下午三點提醒我繳費</code>
 <code>重要提醒 [誰] [日期] [時間] [事件]</code>
+也可說：<code>明晚八點重要提醒我繳費</code>
 <code>週期提醒</code> — 設定每週重複
 <code>提醒清單</code> — 管理所有提醒
 
@@ -189,6 +192,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         elif action == "edit_tracker_field":
             await handle_tracker_edit_value(update, ctx, user_states, text)
+            start_tracker_scan()
             return
 
         elif action == "edit_memory_content":
@@ -226,7 +230,9 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_tracker_delete(update, ctx, text[4:].strip()); return
     if any(text.startswith(p + " ") or text.startswith(p + "\u3000")
            for p in TRACKER_TRIGGER_MAP):
-        await handle_tracker_input(update, ctx, text); return
+        await handle_tracker_input(update, ctx, text)
+        start_tracker_scan()
+        return
 
     if text in ("提醒清單", "📋 提醒清單"):
         await handle_reminder_list(update, ctx); return
@@ -236,8 +242,10 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_priority_reminder(update, ctx, text); return
     if text.startswith("提醒"):
         await handle_reminder(update, ctx, text); return
+    if looks_like_important_reminder(text):
+        await handle_reminder_preview(update, ctx, text, "priority"); return
     if looks_like_natural_reminder(text):
-        await handle_reminder(update, ctx, text); return
+        await handle_reminder_preview(update, ctx, text, "regular"); return
     if text == "週期提醒":
         await handle_recurring(update, ctx); return
     if text in ("地點", "地點清單", "📍 地點清單"):
@@ -317,6 +325,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await cb_set_reminder(update, ctx, int(parts[1]), int(parts[2]))
         elif parts[0] == "src":
             await cb_custom_reminder_prompt(update, ctx, int(parts[1]))
+
+        # ── 自然語言提醒解析預覽
+        elif parts[0] == "rp":
+            await cb_reminder_preview(update, ctx, parts[1])
 
         elif parts[0] == "set":
             await handle_settings_callback(update, ctx, parts[1], user_states)
@@ -410,6 +422,63 @@ def dashboard(token):
     if page is None:
         return Response("Not found", status=404, mimetype="text/plain; charset=utf-8")
     return Response(page, mimetype="text/html; charset=utf-8")
+
+
+def _api_response(payload, status=200):
+    response = jsonify(payload)
+    response.status_code = status
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    return response
+
+
+def _first_value(data, *keys, default=""):
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return default
+
+
+@app.route("/api/point-reminder/<token>", methods=["POST", "OPTIONS"])
+@app.route("/api/points/reminder/<token>", methods=["POST", "OPTIONS"])
+@app.route("/point-reminder/<token>", methods=["POST", "OPTIONS"])
+def point_reminder_api(token):
+    if request.method == "OPTIONS":
+        return _api_response({"ok": True})
+
+    setting = get_user_setting_by_dashboard_token(token)
+    if not setting:
+        return _api_response({"ok": False, "error": "invalid token"}, 404)
+
+    data = request.get_json(silent=True) or request.form.to_dict() or {}
+    title = _first_value(data, "title", "name", "item", default="點數提醒")
+    points = _first_value(data, "points", "point", "balance", "amount")
+    expire_date = _first_value(data, "expire_date", "expires_at", "expires", "date")
+    message = _first_value(data, "message", "content", "body", "note")
+    url = _first_value(data, "url", "link")
+
+    lines = ["💎 點數提醒", f"項目：{title}"]
+    if points:
+        lines.append(f"點數：{points}")
+    if expire_date:
+        lines.append(f"到期：{expire_date}")
+    if message:
+        lines.append("")
+        lines.append(message)
+    if url:
+        lines.append("")
+        lines.append(url)
+
+    try:
+        _async(_ptb_app.bot.send_message(chat_id=str(setting.user_id), text="\n".join(lines)))
+    except Exception as e:
+        logger.error("point reminder send failed: %s", e, exc_info=True)
+        return _api_response({"ok": False, "error": "send failed"}, 500)
+
+    return _api_response({"ok": True, "sent": True})
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():

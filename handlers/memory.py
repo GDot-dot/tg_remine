@@ -58,20 +58,68 @@ def stored_memory_content(content: str) -> str:
     return format_memory_content(content)
 
 
-def extract_message_html(update: Update, plain_content: str, prefix: str = "") -> str:
+def strip_html_plain_prefix(html_text: str, plain_prefix: str) -> str | None:
+    i = 0
+    consumed = 0
+    while i < len(html_text) and consumed < len(plain_prefix):
+        if html_text[i] == "<":
+            end = html_text.find(">", i + 1)
+            if end == -1:
+                return None
+            i = end + 1
+            continue
+        if html_text[i] == "&":
+            end = html_text.find(";", i + 1)
+            if end != -1:
+                entity = html.unescape(html_text[i:end + 1])
+                if plain_prefix.startswith(entity, consumed):
+                    consumed += len(entity)
+                    i = end + 1
+                    continue
+        char = html.unescape(html_text[i])
+        if not plain_prefix.startswith(char, consumed):
+            return None
+        consumed += len(char)
+        i += 1
+    return html_text[i:] if consumed == len(plain_prefix) else None
+
+
+def extract_message_html(update: Update, plain_content: str, plain_prefix: str = "") -> str:
     msg = update.message
     if not msg:
         return format_memory_content(plain_content)
 
     html_text = getattr(msg, "text_html", None)
-    if html_text and msg.entities and (not prefix or html_text.startswith(prefix)):
-        return html_text[len(prefix):]
+    if html_text and msg.entities:
+        if not plain_prefix:
+            return html_text
+        stripped = strip_html_plain_prefix(html_text, plain_prefix)
+        if stripped is not None:
+            return stripped
 
     return format_memory_content(plain_content)
 
 
-def extract_memory_content_html(update: Update, keyword: str, plain_content: str) -> str:
-    return extract_message_html(update, plain_content, f"記住 {keyword} ")
+def parse_memory_save_text(text: str) -> tuple[str, str, str] | None:
+    if not text.startswith("記住"):
+        return None
+    i = 2
+    while i < len(text) and text[i].isspace():
+        i += 1
+    keyword_start = i
+    while i < len(text) and not text[i].isspace():
+        i += 1
+    keyword = text[keyword_start:i].strip().replace("\n", "").replace("\r", "")
+    while i < len(text) and text[i].isspace():
+        i += 1
+    content = text[i:]
+    if not keyword or not content:
+        return None
+    return keyword, content, text[:i]
+
+
+def extract_memory_content_html(update: Update, plain_content: str, plain_prefix: str) -> str:
+    return extract_message_html(update, plain_content, plain_prefix)
 
 
 def memory_text(keyword: str, content: str) -> str:
@@ -96,8 +144,8 @@ async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: st
     user_id = update.effective_user.id
 
     if text.startswith("記住"):
-        parts = text[2:].strip().split(" ", 1)
-        if len(parts) < 2:
+        parsed = parse_memory_save_text(text)
+        if not parsed:
             await _reply(
                 update,
                 "格式：<code>記住 [關鍵字] [內容]</code>\n"
@@ -106,9 +154,8 @@ async def handle_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: st
                 parse_mode=ParseMode.HTML,
             )
             return
-        keyword, content = parts
-        keyword = keyword.strip().replace("\n", "").replace("\r", "")
-        content_html = extract_memory_content_html(update, keyword, content)
+        keyword, content, plain_prefix = parsed
+        content_html = extract_memory_content_html(update, content, plain_prefix)
         stored_content = MEMORY_HTML_PREFIX + content_html
         existing = query_memory(user_id, keyword)
         exact = next((m for m in existing if m.keyword == keyword), None)
