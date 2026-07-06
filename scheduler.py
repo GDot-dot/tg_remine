@@ -40,6 +40,27 @@ CWA_COUNTY_DATASET_IDS = {
     "臺中市": "F-D0047-073", "臺南市": "F-D0047-077", "連江縣": "F-D0047-081",
     "金門縣": "F-D0047-085",
 }
+CWA_UVI_CHART_URL = "https://www.cwa.gov.tw/Data/js/OBS_UVI_chart.js"
+CWA_UVI_STATIONS = {
+    "46694": "基隆", "46690": "淡水", "46688": "新北", "46693": "陽明山",
+    "46757": "新竹", "46749": "臺中", "46735": "澎湖", "46765": "日月潭",
+    "46753": "阿里山", "46755": "玉山", "46748": "嘉義", "46744": "高雄",
+    "46759": "恆春", "46708": "宜蘭", "46699": "花蓮", "46761": "成功",
+    "46766": "臺東", "46754": "大武", "46762": "蘭嶼", "46692": "臺北",
+    "46741": "臺南", "46711": "金門", "46799": "馬祖", "46705": "新屋",
+    "46727": "田中", "46728": "後龍", "46729": "古坑",
+}
+CWA_UVI_LOCATION_STATIONS = {
+    "新北市淡水區": "46690", "淡水區": "46690", "淡水": "46690",
+    "基隆市": "46694", "臺北市": "46692", "新北市": "46688",
+    "桃園市": "46705", "新竹縣": "46757", "新竹市": "46757",
+    "苗栗縣": "46728", "臺中市": "46749", "彰化縣": "46727",
+    "南投縣": "46765", "雲林縣": "46729", "嘉義縣": "46748",
+    "嘉義市": "46748", "臺南市": "46741", "高雄市": "46744",
+    "屏東縣": "46759", "宜蘭縣": "46708", "花蓮縣": "46699",
+    "臺東縣": "46766", "澎湖縣": "46735", "金門縣": "46711",
+    "連江縣": "46799", "馬祖": "46799",
+}
 
 PRIORITY_RULES = {
     1: {"icon": "🟢", "interval": 30, "repeats": 3},
@@ -631,6 +652,75 @@ def _uv_curve(values):
         points.append(blocks[index])
     return "".join(points)
 
+def _select_uvi_station_id(county, district):
+    location_key = f"{county or ''}{district or ''}"
+    for key in sorted(CWA_UVI_LOCATION_STATIONS, key=len, reverse=True):
+        if key and (key in location_key or key == county or key == district):
+            return CWA_UVI_LOCATION_STATIONS[key]
+    return CWA_UVI_LOCATION_STATIONS.get(county or "")
+
+def _parse_cwa_uvi_chart(js_text, station_id):
+    time_match = re.search(r'var\s+Time_From\s*=\s*"([^"]+)"', js_text or "")
+    uvi_match = re.search(rf"'{re.escape(station_id)}'\s*:\s*\[(.*?)\]", js_text or "", re.S)
+    if not time_match or not uvi_match:
+        return []
+
+    try:
+        start = TAIPEI_TZ.localize(datetime.strptime(time_match.group(1), "%Y/%m/%d %H:%M"))
+    except ValueError:
+        return []
+
+    points = []
+    for index, raw_value in enumerate(re.findall(r"y\s*:\s*(-?\d+(?:\.\d+)?)", uvi_match.group(1))):
+        uv = _to_float(raw_value)
+        if uv is None:
+            continue
+        points.append({
+            "time": start + timedelta(hours=index),
+            "uv": uv,
+            "value": uv,
+        })
+    return points
+
+def build_uvi_observation_summary(county, district):
+    station_id = _select_uvi_station_id(county, district)
+    if not station_id:
+        return ""
+
+    try:
+        response = requests.get(CWA_UVI_CHART_URL, timeout=8)
+        response.encoding = "utf-8"
+        points = _parse_cwa_uvi_chart(response.text, station_id)
+    except Exception as e:
+        logger.warning("fetch CWA UVI observation failed for %s%s: %s", county, district, e)
+        return ""
+
+    if not points:
+        return ""
+
+    today = datetime.now(TAIPEI_TZ).date()
+    today_points = [point for point in points if point["time"].date() == today]
+    display_points = [
+        point for point in today_points
+        if 6 <= point["time"].hour <= 18
+    ] or today_points or points[-8:]
+    latest = points[-1]
+    max_point = max(display_points, key=lambda point: point["uv"])
+    risky = [point for point in display_points if point["uv"] >= 6]
+    if risky:
+        risk_time = "、".join(point["time"].strftime("%H:%M") for point in risky[:4])
+    else:
+        risk_time = "10:00-14:00 通常較高"
+
+    curve = _uv_curve(display_points[-8:])
+    latest_text = f"{latest['uv']:.0f}" if latest["uv"].is_integer() else f"{latest['uv']:.1f}"
+    max_text = f"{max_point['uv']:.0f}" if max_point["uv"].is_integer() else f"{max_point['uv']:.1f}"
+    station_name = CWA_UVI_STATIONS.get(station_id, station_id)
+    return (
+        f"\n☀️ 紫外線觀測（{station_name}站）{curve} 目前 {latest_text}（{_uv_level(latest['uv'])}），"
+        f"今日最高 {max_text}（{_uv_level(max_point['uv'])}），注意時間：{risk_time}。{_uv_advice(max_point['uv'])}"
+    )
+
 def build_uv_summary(location):
     uv_values = _cwa_element_time_values_any(
         location,
@@ -721,7 +811,7 @@ def fetch_weather_summary(city):
         temp_max = max(max_values or temp_values) if (max_values or temp_values) else None
         temp = f"{temp_min}-{temp_max}°C" if temp_min is not None and temp_max is not None else "溫度未知"
         rain_text = f"降雨機率 {rain}%" if rain is not None else "降雨機率未知"
-        uv_summary = build_uv_summary(location)
+        uv_summary = build_uv_summary(location) or build_uvi_observation_summary(county, district)
         return f"🌤 {location_label}今日天氣：{wx}，{temp}，{rain_text}。{_weather_advice(wx, rain, temp_max, comfort)}{uv_summary}"
     except Exception as e:
         logger.warning("fetch CWA weather failed for %s: %s", city, e)
