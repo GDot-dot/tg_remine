@@ -169,6 +169,98 @@ def _esc(value):
     return html.escape(str(value or ""))
 
 
+def _week_dates(base=None):
+    base = base or _now_taipei().date()
+    monday = base - timedelta(days=base.weekday())
+    return [monday + timedelta(days=i) for i in range(7)]
+
+
+def _calendar_group(item_date):
+    today = _now_taipei().date()
+    if item_date == today:
+        return "today"
+    if item_date == today + timedelta(days=1):
+        return "tomorrow"
+    return "week"
+
+
+def _reminder_calendar_item(ev, item_date, time_str, badge, note=""):
+    return {
+        "date": item_date,
+        "time": time_str,
+        "content": ev.event_content or "(無內容)",
+        "badge": badge,
+        "note": note,
+        "important": 1 if ev.priority_level else 0,
+        "search": f"{ev.event_content or ''} {badge} {note}",
+    }
+
+
+def _week_calendar_items(reminders):
+    dates = _week_dates()
+    date_set = set(dates)
+    items = {day: [] for day in dates}
+
+    for ev in reminders:
+        if ev.is_recurring:
+            days, time_str = _parse_recurring_rule(ev.recurrence_rule)
+            for day in dates:
+                code = WEEKDAY_CODES[day.weekday()]
+                if code in days:
+                    items[day].append(_reminder_calendar_item(ev, day, time_str, "週期"))
+            continue
+
+        event_dt = _as_taipei(ev.event_datetime) or _as_taipei(ev.reminder_time)
+        reminder_dt = _as_taipei(ev.reminder_time)
+        if not event_dt or event_dt.date() not in date_set:
+            continue
+
+        note = ""
+        if reminder_dt and reminder_dt != event_dt:
+            note = f"提醒 {reminder_dt.strftime('%m/%d %H:%M')}"
+        badge = "重要" if ev.priority_level else STATUS_LABELS.get(event_effective_status(ev), "提醒")
+        items[event_dt.date()].append(
+            _reminder_calendar_item(ev, event_dt.date(), event_dt.strftime("%H:%M"), badge, note)
+        )
+
+    for day in dates:
+        items[day].sort(key=lambda item: item["time"])
+    return dates, items
+
+
+def _calendar_html(reminders):
+    today = _now_taipei().date()
+    dates, items = _week_calendar_items(reminders)
+    day_names = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+    columns = []
+    for day in dates:
+        day_items = []
+        for item in items[day]:
+            group = _calendar_group(day)
+            badge_class = "badge recurring" if item["badge"] == "週期" else "badge important" if item["important"] else "badge"
+            note = f'<div class="calendar-note">{_esc(item["note"])}</div>' if item["note"] else ""
+            day_items.append(
+                f'<div class="calendar-item data-row reminder-row" data-kind="reminder" '
+                f'data-group="{group}" data-important="{item["important"]}" '
+                f'data-search="{_esc(item["search"].lower())}">'
+                f'<div class="calendar-time">{_esc(item["time"])}</div>'
+                f'<div class="calendar-content">{_esc(item["content"])}</div>'
+                f'<span class="{badge_class}">{_esc(item["badge"])}</span>'
+                f'{note}'
+                '</div>'
+            )
+        if not day_items:
+            day_items.append('<div class="calendar-empty">沒有提醒</div>')
+        today_class = " today" if day == today else ""
+        columns.append(
+            f'<div class="calendar-day{today_class}">'
+            f'<div class="calendar-date"><b>{_esc(day_names[day.weekday()])}</b><span>{day.strftime("%m/%d")}</span></div>'
+            f'{"".join(day_items)}'
+            '</div>'
+        )
+    return "".join(columns)
+
+
 def _reminder_rows(groups):
     rows = []
     for group, events in groups.items():
@@ -264,6 +356,7 @@ def render_dashboard_page(token, notice=None):
     memories = list_memories(user_id)
     locations = get_locations(user_id)
     groups = _event_groups(reminders)
+    calendar_html = _calendar_html(reminders)
     generated_at = _now_taipei().strftime("%Y/%m/%d %H:%M")
     upcoming = [t for t in sorted(trackers, key=_tracker_sort_key) if _tracker_due_date(t)][:5]
 
@@ -364,6 +457,59 @@ def render_dashboard_page(token, notice=None):
     .grid {{ display: grid; grid-template-columns: 1.35fr .9fr; gap: 14px; align-items: start; }}
     section {{ padding: 16px; margin-bottom: 14px; overflow: hidden; }}
     .focus ul {{ margin: 0; padding-left: 20px; }}
+    .calendar {{
+      display: grid;
+      grid-template-columns: repeat(7, minmax(118px, 1fr));
+      gap: 8px;
+      margin-bottom: 16px;
+      overflow-x: auto;
+      padding-bottom: 2px;
+    }}
+    .calendar-day {{
+      min-height: 138px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfdff;
+      padding: 8px;
+    }}
+    .calendar-day.today {{
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }}
+    .calendar-date {{
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 6px;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .calendar-date b {{ color: var(--text); font-size: 13px; }}
+    .calendar-item {{
+      background: #fff;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--accent);
+      border-radius: 7px;
+      padding: 7px;
+      margin-bottom: 7px;
+      font-size: 13px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
+    }}
+    .calendar-time {{ font-weight: 750; color: var(--accent); }}
+    .calendar-content {{ margin: 2px 0 5px; }}
+    .calendar-note {{ margin-top: 4px; color: var(--muted); font-size: 12px; }}
+    .calendar-empty {{ color: var(--muted); font-size: 12px; padding: 8px 2px; }}
+    .badge {{
+      display: inline-block;
+      border-radius: 999px;
+      background: #eef2f7;
+      color: #475569;
+      padding: 1px 7px;
+      font-size: 12px;
+    }}
+    .badge.recurring {{ background: #ecfdf3; color: #166534; }}
+    .badge.important {{ background: #fef2f2; color: #b91c1c; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
     th, td {{ padding: 9px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }}
     th {{ color: var(--muted); font-weight: 600; font-size: 12px; }}
@@ -380,6 +526,7 @@ def render_dashboard_page(token, notice=None):
       .stats {{ grid-template-columns: repeat(2, 1fr); }}
       .grid {{ display: block; }}
       .toolbar {{ grid-template-columns: 1fr; }}
+      .calendar {{ grid-template-columns: repeat(7, 150px); }}
       table {{ font-size: 13px; }}
       th, td {{ padding: 8px 6px; }}
       .hide-mobile {{ display: none; }}
@@ -428,6 +575,9 @@ def render_dashboard_page(token, notice=None):
       <main>
         <section id="reminders">
           <h2>提醒</h2>
+          <div class="calendar" aria-label="本週提醒行事曆">
+            {calendar_html}
+          </div>
           <table>
             <tbody>
               {_reminder_rows(groups)}
@@ -512,7 +662,7 @@ def render_dashboard_page(token, notice=None):
 
     function applyFilters() {{
       const query = searchBox.value.trim().toLowerCase();
-      document.querySelectorAll('tr.data-row').forEach(row => {{
+      document.querySelectorAll('.data-row').forEach(row => {{
         const visible = rowMatchesSearch(row, query) && reminderMatches(row) && trackerMatches(row);
         row.classList.toggle('is-hidden', !visible);
       }});

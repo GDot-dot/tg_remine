@@ -15,8 +15,8 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from db import get_user_setting_by_dashboard_token, init_db
-from scheduler import scheduler, safe_start, start_tracker_scan
+from db import get_user_setting, get_user_setting_by_dashboard_token, init_db
+from scheduler import fetch_weather_summary, scheduler, safe_start, start_tracker_scan
 from handlers.tracker import (
     handle_tracker_input, handle_tracker_list,
     handle_monthly_cost, handle_tracker_delete,
@@ -118,6 +118,7 @@ HELP_TEXT = """🤖 <b>Telegram 智慧管家</b>
 <code>設定</code> / <code>/settings</code>
 可設定地區/城市、早上今日摘要、晚上明日預告、是否附上天氣、常用延後按鈕。
 天氣來源只使用中央氣象署 CWA；包含天氣狀態、最高/最低溫、降雨機率、出門建議。
+<code>即時天氣</code> / <code>/weather</code> — 立即查看目前設定地區的天氣與紫外線觀測
 
 <b>通用</b>：<code>取消</code> — 中斷操作"""
 
@@ -151,6 +152,13 @@ async def send_dashboard_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("🌐 開啟 Web 儀表板", url=url)
     ]])
     await update.message.reply_text("🌐 Web 儀表板：", reply_markup=markup)
+
+async def send_current_weather(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    setting = get_user_setting(update.effective_user.id)
+    city = setting.city or "台北"
+    await update.message.reply_text("🌤 正在讀取中央氣象署資料...")
+    weather = fetch_weather_summary(city) or "暫時查不到天氣資料，請確認設定中心的地區。"
+    await update.message.reply_text(weather, parse_mode=ParseMode.HTML)
 
 
 async def handle_location_msg_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -214,6 +222,9 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if text in ("Web 儀表板", "🌐 Web 儀表板", "儀表板", "Dashboard", "dashboard"):
         await send_dashboard_link(update, ctx)
+        return
+    if text in ("即時天氣", "🌤 即時天氣", "天氣", "目前天氣", "現在天氣"):
+        await send_current_weather(update, ctx)
         return
     if text in ("貼圖轉換", "🎨 貼圖轉換"):
         await handle_sticker_toggle(update, ctx)
@@ -399,6 +410,7 @@ def build_ptb_app() -> Application:
     a.add_handler(CommandHandler("start", cmd_start))
     a.add_handler(CommandHandler("help",  cmd_help))
     a.add_handler(CommandHandler("settings", cmd_settings))
+    a.add_handler(CommandHandler("weather", send_current_weather))
     a.add_handler(CommandHandler("hide_keyboard", cmd_hide_keyboard))
     a.add_handler(MessageHandler(filters.LOCATION, handle_location_msg_entry))
     a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
